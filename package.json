@@ -1,0 +1,1 @@
+{"name":"backlink-tool","version":"1.0.0","private":true,"scripts":{"dev":"next dev","prebuild":"node scripts/build-runner-zip.mjs","build":"next build","start":"next start"},"dependencies":{"next":"^16.4.2","postgres":"^3.4.9","react":"^19.3.1","react-dom":"^19.3.1"},"devDependencies":{"@electric-sql/pglite":"^0.5.11"}}

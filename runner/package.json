@@ -1,0 +1,13 @@
+{
+  "name": "backlink-runner",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Runs on a team PC: takes queued sites from the Backlink Tool dashboard and works through them in a visible Chrome window.",
+  "main": "runner.js",
+  "scripts": {
+    "start": "node runner.js"
+  },
+  "dependencies": {
+    "playwright-core": "^1.48.0"
+  }
+}

@@ -1,0 +1,21 @@
+node_modules/
+.next/
+.vercel/
+.localdb/
+.env*
+!.env.example
+
+# Archived local-only version of the tool (contains vault.key and client data)
+_old/
+
+# Runner download, built from runner/ before every build (scripts/build-runner-zip.mjs)
+public/backlink-runner.zip
+
+# Supabase MCP settings for the local Claude session
+.mcp.json
+
+# Runner files created on each PC
+runner/node_modules/
+runner/runtime/
+runner/browser-profile/
+runner/config.json
