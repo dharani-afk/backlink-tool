@@ -335,7 +335,7 @@ function genPassword() {
 
 // ---- Finding the listing page ---------------------------------------------------
 // Link text and addresses that usually lead to the page where a site takes new listings.
-const SUBMIT_LINK = /submit|add (a |an |your |new )?(site|website|listing|url|link|product|tool|startup|business|app|company|saas|software|service|resource)|list (your|my) |get listed|suggest (a |an )?(site|website|tool|link|product|startup|resource)|new listing|create (a )?listing|free listing|basic listing|claim (your )?(listing|business)|sell on|start selling|become a (seller|supplier|vendor)|join as (a )?(business|seller|supplier|vendor)|register (your |as a )?(business|seller|supplier)/i;
+const SUBMIT_LINK = /submit|add (a |an |your |new )?(site|website|listing|url|link|product|tool|startup|business|app|company|saas|software|service|resource)|list (your|my) |get listed|suggest (a |an )?(site|website|tool|link|product|startup|resource)|new listing|create (a )?listing|free listing|basic listing|claim (your )?(listing|business)|sell on|start selling|become a (seller|supplier|vendor)|join as (a )?(business|seller|supplier|vendor)|register (your |as a )?(business|seller|supplier|company|firm|shop|store)/i;
 const SUBMIT_PATH = /submit|add[-_]?((your|a|new)[-_]?)?(site|website|url|link|listing|business|product|tool|startup|company|app)|addurl|list[-_]?your|get[-_]?listed|suggest[-_]((a|an|your|new)[-_])?(site|website|link|url|tool|listing|business|resource|startup|product|company)|new[-_]?listing|listings?\/(new|add|create)|create[-_]?listing|free[-_]?listing|sell[-_]?on|seller[-_]?(registration|signup|sign-up|register|join)|become[-_]?a[-_]?(seller|supplier|vendor|partner)|join[-_]?as|register[-_]?(your[-_]?)?(business|company)|business[-_]?(registration|signup|sign-up)|claim[-_]?(your[-_]?)?(business|listing)/i;
 const NOT_SUBMIT = /log ?in|log ?out|sign ?in|newsletter|subscribe|ticket|review|comment|feedback|report|careers|privacy|terms|cookie|contact/i;
 const COMMON_SUBMIT_PATHS = [
@@ -343,7 +343,15 @@ const COMMON_SUBMIT_PATHS = [
   '/add', '/add-site', '/add-listing', '/add-your-site', '/add-business', '/add-url', '/addurl', '/suggest',
   '/list-your-business', '/get-listed', '/listing/add', '/listings/new', '/new-listing', '/submit.php', '/add.php',
 ];
-const siteBase = (h) => h.replace(/^www\./, '').split('.').slice(-2).join('.');
+// The registrable domain: seller.indiamart.com -> indiamart.com, www.businesslisting.co.in -> businesslisting.co.in
+// (two-part endings such as .co.in or .co.uk keep three labels, so two different .co.in sites never count as one).
+const isIpOrLocal = (h) => /^\d+(\.\d+){3}$/.test(h) || h === 'localhost' || h.includes(':');
+function siteBase(h) {
+  if (isIpOrLocal(h)) return h.toLowerCase(); // an IP address is one site; its last two numbers are not a domain
+  const p = h.toLowerCase().replace(/^www\./, '').split('.');
+  const twoPart = p.length > 2 && /^(co|com|org|net|gov|ac|edu|firm|gen|ind|nic|biz|info|ltd|plc)$/.test(p[p.length - 2]) && p[p.length - 1].length === 2;
+  return p.slice(twoPart ? -3 : -2).join('.');
+}
 
 // What the open page is: 'form' (a listing form with a website field), 'maybe' (a form without one,
 // e.g. a contact form), 'login' (a login or sign-up wall), 'start' (just a mobile number or email box,
@@ -356,26 +364,130 @@ async function pageKind(page) {
   return keys.includes('url') ? 'form' : 'maybe';
 }
 
-// Same-site links on the open page (menus and footers included, even when hidden), best match first.
-async function submitLinks(page, tried) {
-  const here = new URL(page.url());
-  const links = await page.$$eval('a[href]', (as) => as.map((a) => ({
-    href: a.href, text: (a.innerText || a.getAttribute('aria-label') || a.title || a.textContent || '').trim().slice(0, 80),
+// Words that hint at the way in for businesses without being a listing link themselves ("For business owners",
+// "Advertise", "Partners"). Pages behind them are explored, but they score lower than a real listing link.
+const HINT_TEXT = /for business|business owner|businesses|advertis|partner|seller|supplier|vendor|merchant|get started|join (us|now|free)|pricing|plans|grow your business|\blistings?\b|register|sign ?up|create (an |your )?account|my business|business (account|profile|cent(er|re)|dashboard|solutions)/i;
+const HINT_PATH = /business|advertis|partner|seller|supplier|vendor|merchant|pricing|plans|join|register|signup|sign-up|listing|onboard|get-started|owner/i;
+const NOT_LISTING_PAGE = /\/(blog|blogs|news|article|articles|press|help|faq|faqs|support|tag|tags|author|category|categories|search|jobs|careers|events?)(\/|$)/i;
+// Titles and headings of pages where a business is added.
+const LISTING_TITLE = /list(ing)? (your|my) business|add (your |a |new )?(business|listing|company)|free (business )?listing|get listed|submit (your |a )?(business|listing|site|website|url|link)|business (registration|sign ?up)|register (your )?business|join as|sell on|become a (seller|supplier|vendor|partner)|claim (your )?(business|listing)|create (a )?(free )?(listing|business profile)/i;
+
+// Listing pages of popular directories, checked by hand. Tried first; a stale entry just falls back to searching.
+const KNOWN_LISTING_PAGES = {
+  'justdial.com': 'https://www.justdial.com/Free-Listing',
+  'sulekha.com': 'https://www.sulekha.com/list-your-business',
+  'indiamart.com': 'https://seller.indiamart.com/',
+  'tradeindia.com': 'https://www.tradeindia.com/join_now/upload_product.html',
+  'infolive.in': 'https://infolive.in/list-your-business',
+  'businesslisting.co.in': 'https://businesslisting.co.in/submit-listing',
+};
+
+// How much a link looks like the way to the listing page, from its text and address, with the reasons.
+function linkScore(text, u) {
+  const where = u.pathname + u.search;
+  const why = [];
+  let s = 0;
+  if (SUBMIT_LINK.test(text)) { s += 6; why.push(`link "${text.slice(0, 50)}"`); }
+  else if (HINT_TEXT.test(text)) { s += 2; why.push(`link "${text.slice(0, 50)}"`); }
+  if (SUBMIT_PATH.test(where)) { s += 4; why.push('address looks like a submit page'); }
+  else if (HINT_PATH.test(where)) s += 1;
+  if (NOT_SUBMIT.test(text) || NOT_SUBMIT.test(where)) s -= 6;
+  if (NOT_LISTING_PAGE.test(u.pathname)) s -= 3;
+  const parts = u.pathname.split('/').filter(Boolean);
+  // Long slugs are articles about listing ("how-to-list-your-business-online"), deep paths are usually listings.
+  if ((parts[parts.length - 1] || '').split(/[-_]/).length > 5) s -= 4;
+  if (parts.length > 4) s -= 1;
+  return { score: s, why };
+}
+
+// Links on the open page as rendered (menus and footers included, even when hidden).
+async function pageLinks(page) {
+  return page.$$eval('a[href]', (as) => as.map((a) => ({
+    href: a.href, text: (a.innerText || a.getAttribute('aria-label') || a.title || a.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80),
   }))).catch(() => []);
+}
+
+// Read a fetched page without opening it: its links, form fields, title and headings. The HTML is parsed by
+// the browser's DOMParser, which never runs the page's scripts.
+async function analyzeHtml(page, html, base) {
+  if (!html) return null;
+  return page.evaluate(({ html, base }) => {
+    const d = new DOMParser().parseFromString(html, 'text/html');
+    const abs = (h) => { try { return new URL(h, base).href; } catch { return null; } };
+    const links = [...d.querySelectorAll('a[href]')].slice(0, 2000)
+      .map((a) => ({ href: abs(a.getAttribute('href')), text: (a.textContent || a.getAttribute('aria-label') || a.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0, 80) }))
+      .filter((l) => l.href);
+    const fields = [...d.querySelectorAll('input, textarea, select')].slice(0, 200).map((e) => {
+      const lab = (e.id && d.querySelector(`label[for="${CSS.escape(e.id)}"]`)) || e.closest('label');
+      const hint = [e.getAttribute('name'), e.id, e.getAttribute('placeholder'), e.getAttribute('aria-label')].join(' ');
+      return {
+        tag: e.tagName.toLowerCase(), type: (e.getAttribute('type') || (e.tagName === 'INPUT' ? 'text' : '')).toLowerCase(),
+        name: e.getAttribute('name') || '', id: e.id || '', ph: e.getAttribute('placeholder') || '', aria: e.getAttribute('aria-label') || '',
+        label: lab ? lab.textContent.replace(/\s+/g, ' ').trim().slice(0, 60) : '',
+        search: e.getAttribute('type') === 'search' || !!e.closest('[role="search"], form[action*="search" i]') || /\bsearch|\bq\b|^q$/i.test(hint),
+      };
+    });
+    const heads = [...d.querySelectorAll('h1, h2')].slice(0, 6).map((h) => h.textContent.replace(/\s+/g, ' ').trim()).join(' | ');
+    return { links, fields, title: (d.title || '').trim(), heads, password: !!d.querySelector('input[type="password"]') };
+  }, { html: html.slice(0, 3000000), base }).catch(() => null);
+}
+
+// How much a fetched page itself looks like the listing page: its form and its title/headings, with the reasons.
+function pageScore(a) {
+  const why = [];
+  let s = 0;
+  const keys = a.fields.filter((f) => !SKIP_TYPES.includes(f.type) && !f.search).map(classify).filter(Boolean);
+  if (keys.length >= 3 && keys.includes('url')) { s += 8; why.push(`form with ${keys.length} business fields incl. website`); }
+  else if (keys.length >= 3) { s += 4; why.push(`form with ${keys.length} fields`); }
+  else if (a.password) { s += 3; why.push('login or sign-up form'); }
+  else if (keys.includes('phone') || keys.includes('email')) { s += 2; why.push('mobile/email sign-up box'); }
+  const words = `${a.title} | ${a.heads}`;
+  if (LISTING_TITLE.test(words) || SUBMIT_LINK.test(a.title)) { s += 4; why.push(`page title/heading "${words.slice(0, 70)}"`); }
+  else if (HINT_TEXT.test(words)) s += 1;
+  return { score: s, why };
+}
+
+// Fetch a page with this Chrome's cookies, following redirects. Returns { url, status, html } or null.
+async function fetchPage(page, url) {
+  try {
+    const r = await page.request.get(url, { timeout: 12000, maxRedirects: 5 });
+    const type = r.headers()['content-type'] || '';
+    return { url: r.url(), status: r.status(), html: /html|xml|text/.test(type) || !type ? await r.text() : '' };
+  } catch { return null; }
+}
+
+// The site's own pages that a web search (DuckDuckGo, then Bing) returns for listing words, read from the
+// public result pages like a person would. No API key; a blocked or empty search just adds nothing.
+async function webSearch(page, host) {
+  if (isIpOrLocal(host)) return []; // search engines index domain names only
+  const site = siteBase(host);
+  const queries = [`site:${site} free listing list your business`, `site:${site} add business submit listing register`];
   const out = new Map();
-  for (const l of links) {
-    let u;
-    try { u = new URL(l.href); } catch { continue; }
-    if (!/^https?:$/.test(u.protocol) || siteBase(u.hostname) !== siteBase(here.hostname)) continue;
-    u.hash = '';
-    if (tried.has(u.href)) continue;
-    const where = u.pathname + u.search;
-    let score = (SUBMIT_LINK.test(l.text) ? 3 : 0) + (SUBMIT_PATH.test(where) ? 2 : 0);
-    if (!score) continue;
-    if (NOT_SUBMIT.test(l.text) || NOT_SUBMIT.test(where)) score -= 4;
-    if (score > 0 && score > (out.get(u.href) || 0)) out.set(u.href, score);
+  for (const q of queries) {
+    for (const engine of ['duckduckgo', 'bing']) {
+      const url = engine === 'duckduckgo' ? `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}` : `https://www.bing.com/search?q=${encodeURIComponent(q)}&setlang=en`;
+      const res = await fetchPage(page, url);
+      const a = res && res.status === 200 && (await analyzeHtml(page, res.html, url));
+      let found = 0;
+      for (const l of (a && a.links) || []) {
+        let href = l.href;
+        try {
+          const u = new URL(href);
+          if (/duckduckgo\.com$/.test(u.hostname) && u.searchParams.get('uddg')) href = u.searchParams.get('uddg');
+          else if (/bing\.com$/.test(u.hostname) && /^a1/.test(u.searchParams.get('u') || '')) href = Buffer.from(u.searchParams.get('u').slice(2).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+          const t = new URL(href);
+          if (!/^https?:$/.test(t.protocol) || siteBase(t.hostname) !== site || !l.text) continue;
+          t.hash = '';
+          if (!out.has(t.href)) out.set(t.href, { url: t.href, text: l.text, engine });
+          found++;
+        } catch {}
+      }
+      if (found) break; // this engine answered; no need to ask the other one
+      await sleep(800);
+    }
+    await sleep(1000);
   }
-  return [...out].sort((a, b) => b[1] - a[1]).map(([url]) => url);
+  return [...out.values()];
 }
 
 // Fetch a file without opening it in the tab (sitemaps may be gzipped: .xml.gz).
@@ -389,17 +501,28 @@ async function fetchText(page, url) {
   } catch { return null; }
 }
 
-// Page addresses from the site's sitemaps that look like submit pages, best first. Sitemaps are taken from
-// robots.txt and the usual sitemap addresses; sitemap indexes are followed, page sitemaps before post/product ones.
-async function sitemapSubmitUrls(page, origin, tried) {
+// Candidate pages from the site's sitemaps, scored by the words in their address ("/add-your-business" reads as
+// "add your business"). Sitemaps come from robots.txt and the usual addresses; sitemap indexes are followed (page
+// sitemaps before post/product ones), and HTML "site map" pages are read too, link text included.
+async function sitemapCandidates(page, origin) {
+  const site = siteBase(new URL(origin).hostname);
   const queue = [];
   const robots = await fetchText(page, origin + '/robots.txt');
   if (robots) for (const m of robots.matchAll(/^\s*sitemap:\s*(\S+)/gim)) queue.push(m[1]);
-  queue.push(...['/sitemap.xml', '/sitemap_index.xml', '/wp-sitemap.xml', '/sitemap/sitemap.xml', '/sitemap.xml.gz'].map((p) => origin + p));
-  const childRank = (u) => (/page|main|static|general|misc|core/i.test(u) ? 0 : /post|product|blog|news|categor|tag|author|image|video|city|location|search/i.test(u) ? 2 : 1);
+  queue.push(...['/sitemap.xml', '/sitemap_index.xml', '/wp-sitemap.xml', '/sitemap/sitemap.xml', '/sitemap.xml.gz', '/page-sitemap.xml'].map((p) => origin + p));
+  const childRank = (u) => (/page|main|static|general|misc|core|info/i.test(u) ? 0 : /post|product|blog|news|categor|tag|author|image|video|city|location|search|listing|business|compan/i.test(u) ? 2 : 1);
   const seen = new Set();
-  const found = new Map();
-  for (let fetched = 0; queue.length && fetched < 15 && found.size < 5; ) {
+  const out = new Map();
+  const consider = (href, text) => {
+    let u;
+    try { u = new URL(href); } catch { return; }
+    if (siteBase(u.hostname) !== site) return;
+    u.hash = '';
+    const slugWords = decodeURIComponent(u.pathname).replace(/[-_/.]+/g, ' ').trim();
+    const s = linkScore(text || slugWords, u);
+    if (s.score > 0 && s.score > (out.get(u.href)?.score || 0)) out.set(u.href, { url: u.href, score: s.score, why: s.why });
+  };
+  for (let fetched = 0; queue.length && fetched < 20 && [...out.values()].filter((c) => c.score >= 6).length < 8; ) {
     const sm = queue.shift();
     if (seen.has(sm)) continue;
     seen.add(sm);
@@ -408,22 +531,20 @@ async function sitemapSubmitUrls(page, origin, tried) {
     if (!xml || !/<(urlset|sitemapindex)/i.test(xml)) continue;
     const locs = [...xml.matchAll(/<loc>\s*(?:<!\[CDATA\[)?\s*([^<\s\]]+)/gi)].map((m) => m[1].replace(/&amp;/g, '&'));
     if (/<sitemapindex/i.test(xml)) {
-      queue.push(...locs.sort((a, b) => childRank(a) - childRank(b)));
+      queue.push(...locs);
       queue.sort((a, b) => childRank(a) - childRank(b));
       continue;
     }
-    for (const loc of locs) {
-      let u;
-      try { u = new URL(loc); } catch { continue; }
-      if (siteBase(u.hostname) !== siteBase(new URL(origin).hostname) || tried.has(u.href)) continue;
-      if (!SUBMIT_PATH.test(u.pathname) || NOT_SUBMIT.test(u.pathname)) continue;
-      // Long slugs are articles about listing ("how-to-list-your-business-online"), not the submit page itself.
-      if ((u.pathname.split('/').filter(Boolean).pop() || '').split(/[-_]/).length > 5) continue;
-      // Submit pages sit near the top of a site; deep addresses are usually listings that merely contain the word.
-      found.set(u.href, u.pathname.split('/').filter(Boolean).length);
-    }
+    for (const loc of locs.slice(0, 50000)) consider(loc);
   }
-  return [...found].sort((a, b) => a[1] - b[1]).map(([url]) => url).slice(0, 5);
+  // HTML site maps ("Site map" page in the footer) list the important pages with readable link text.
+  for (const p of ['/sitemap', '/site-map', '/sitemap.html', '/html-sitemap']) {
+    const res = await fetchPage(page, origin + p);
+    if (!res || res.status !== 200 || /<(urlset|sitemapindex)/i.test(res.html.slice(0, 500))) continue;
+    const a = await analyzeHtml(page, res.html, res.url);
+    if (a && a.links.length > 20) { for (const l of a.links) consider(l.href, l.text); break; }
+  }
+  return [...out.values()];
 }
 
 // The usual submit addresses, kept only when the server answers with a page that has a form or a login on it.
@@ -459,45 +580,137 @@ async function openAndCheck(page, url) {
   return kind;
 }
 
-// Find where this site takes new listings and leave Chrome on that page. The site itself is searched first
-// (a form on the page, its links, its buttons), then its sitemap, then the usual submit addresses.
+// Find where this site takes new listings and leave Chrome on that page. Works like a small search agent:
+// it collects candidate pages from every source (known directories, the site's links and buttons, a crawl of the
+// most promising pages, the sitemap, a web search, the usual submit addresses), scores each from its link text,
+// address, title, headings and form, and opens the best ones in Chrome to confirm. The pages it considered and
+// why are recorded on the job.
 // Returns { url, kind, via } with kind 'form', 'login' (the listing page needs an account), 'maybe' or 'start', or null.
+const CRAWL_BUDGET = 25;
+const CONFIRM_BUDGET = 8;
 async function findSubmitPage(j, page) {
   await step(j, 'Looking for where the site can be listed');
   const start = page.url();
   if ((await pageKind(page)) === 'form') return { url: start, kind: 'form', via: 'the opened page' };
-  const origin = new URL(start).origin;
+  const startU = new URL(start);
+  const origin = startU.origin;
+  const site = siteBase(startU.hostname);
+  const cands = new Map(); // url -> { url, score, via, why, sources, read }
   const tried = new Set([start]);
+  const add = (href, score, via, why) => {
+    let u;
+    try { u = new URL(href); } catch { return; }
+    if (!/^https?:$/.test(u.protocol) || siteBase(u.hostname) !== site) return;
+    u.hash = '';
+    if (u.href === start || u.href === start + '/') return;
+    const c = cands.get(u.href);
+    if (!c) return cands.set(u.href, { url: u.href, score, via, why: [...why], sources: new Set([via]), read: false });
+    // Found again from another source: a little more trust; a better reason replaces the old one.
+    if (!c.sources.has(via)) { c.sources.add(via); c.score += 1; }
+    if (score > c.score) { c.score = score; c.via = via; c.why = [...why]; }
+  };
+  const ranked = () => [...cands.values()].filter((c) => !tried.has(c.url) && c.score > 0).sort((a, b) => b.score - a.score);
+  const summary = (list) => list.slice(0, 12).map((c) => ({ url: c.url, score: c.score, via: c.via, why: c.why.join('; ') }));
   // Weaker matches, used only if nothing better turns up: a form without a website field beats a mobile-number box.
   let fallback = null;
-  const visit = async (url, via) => {
-    tried.add(url);
-    const kind = await openAndCheck(page, url);
-    if (kind === 'form' || kind === 'login') return { url, kind, via };
-    if ((kind === 'maybe' && fallback?.kind !== 'maybe') || (kind === 'start' && !fallback)) fallback = { url, kind, via };
+  const visit = async (c) => {
+    tried.add(c.url);
+    const kind = await openAndCheck(page, c.url);
+    if (kind === 'form' || kind === 'login') return { url: c.url, kind, via: c.via };
+    // A known directory page, or one whose title and content clearly say "list your business", is the listing
+    // page even when its first step is a short form (mobile number, company name and city).
+    if (kind && (c.via === 'the list of known directories' || c.score >= 10)) return { url: c.url, kind, via: c.via };
+    if ((kind === 'maybe' && fallback?.kind !== 'maybe') || (kind === 'start' && !fallback)) fallback = { url: c.url, kind, via: c.via };
     return null;
   };
+  const confirm = async (min, max) => {
+    for (const c of ranked().filter((x) => x.score >= min).slice(0, max)) { const r = await visit(c); if (r) return r; }
+    return null;
+  };
+  const found = async (r) => {
+    await step(j, `Chose ${r.url} (via ${r.via}) out of ${cands.size} page(s) considered`, 'info', { candidates: summary([cands.get(r.url) || { url: r.url, score: 0, via: r.via, why: [] }, ...ranked()]) });
+    return r;
+  };
+  let r;
 
-  // 1) Links on the start page, then one step further from the best of them (e.g. a plan page with "Free listing").
-  const links = (await submitLinks(page, tried)).slice(0, 6);
-  for (const u of links) { const r = await visit(u, 'a link on the site'); if (r) return r; }
-  if (links[0]) {
-    await openAndCheck(page, links[0]);
-    for (const u of (await submitLinks(page, tried)).slice(0, 3)) { const r = await visit(u, 'a link on the site'); if (r) return r; }
+  // 1) A directory whose listing page is already known.
+  if (KNOWN_LISTING_PAGES[site]) add(KNOWN_LISTING_PAGES[site], 20, 'the list of known directories', ['known listing page of this directory']);
+  // 2) Links on the page as Chrome shows it; the clearest ones are opened straight away.
+  for (const l of await pageLinks(page)) {
+    let u;
+    try { u = new URL(l.href); } catch { continue; }
+    const s = linkScore(l.text, u);
+    if (s.score > 0) add(l.href, s.score, 'a link on the site', s.why);
   }
-  // 2) A button on the start page that opens the form without a link (pop-ups, JavaScript menus).
+  if ((r = await confirm(5, 3))) return found(r);
+
+  // 3) A button that opens the form without a link (pop-ups, JavaScript menus).
   await openAndCheck(page, start);
   if (await clickByText(page, SUBMIT_LINK, 'button, [role="button"]')) {
     await sleep(1500);
     const kind = await pageKind(page);
-    if (kind === 'form' || kind === 'login') return { url: page.url(), kind, via: 'a button on the site' };
+    if (kind === 'form' || kind === 'login') return found({ url: page.url(), kind, via: 'a button on the site' });
+    await openAndCheck(page, start);
   }
-  // 3) The sitemap.
-  await step(j, 'No listing link or button on the site, checking its sitemap');
-  for (const u of await sitemapSubmitUrls(page, origin, tried)) { const r = await visit(u, 'the sitemap'); if (r) return r; }
-  // 4) The usual submit addresses.
-  for (const u of await guessedSubmitUrls(page, origin, tried)) { const r = await visit(u, 'a common submit address'); if (r) return r; }
-  if (fallback && (await openAndCheck(page, fallback.url))) return fallback;
+
+  // 4) Explore: read the most promising pages without opening them (best first), score what is on them and
+  //    follow their links, so a listing page two or three clicks deep ("For business" > "Plans" > "Free listing") is found.
+  await step(j, 'Exploring the site: reading the most promising pages and following their links');
+  const home = await fetchPage(page, origin + '/');
+  const homeA = home && (await analyzeHtml(page, home.html, home.url));
+  for (const l of (homeA && homeA.links) || []) {
+    let u;
+    try { u = new URL(l.href); } catch { continue; }
+    const s = linkScore(l.text, u);
+    if (s.score > 0) add(l.href, s.score, 'a link on the site', s.why);
+  }
+  for (let n = 0; n < CRAWL_BUDGET; n++) {
+    const c = [...cands.values()].filter((x) => !x.read && x.score > 0).sort((a, b) => b.score - a.score)[0];
+    if (!c) break;
+    c.read = true;
+    const res = await fetchPage(page, c.url);
+    if (!res) continue;
+    if (res.status === 429 || res.status === 403) { await step(j, `The site is limiting requests (HTTP ${res.status}); exploring less`, 'warn'); break; }
+    if (res.status >= 400) { c.score -= 5; continue; }
+    const a = await analyzeHtml(page, res.html, res.url);
+    if (!a) continue;
+    const ps = pageScore(a);
+    c.score += ps.score;
+    c.why.push(...ps.why);
+    const from = new URL(res.url).pathname;
+    for (const l of a.links) {
+      let u;
+      try { u = new URL(l.href); } catch { continue; }
+      const s = linkScore(l.text, u);
+      // Links on a promising page are worth more; every step deeper costs a little.
+      if (s.score > 0) add(l.href, s.score + (c.score >= 8 ? 1 : 0) - 1, `a link on ${from}`, s.why);
+    }
+    await sleep(300);
+  }
+  if ((r = await confirm(8, 3))) return found(r);
+
+  // 5) The sitemap, 6) a web search, 7) the usual submit addresses.
+  await step(j, 'Checking the sitemap and searching the web for the site\'s listing page');
+  for (const c of await sitemapCandidates(page, origin)) add(c.url, c.score, 'the sitemap', c.why);
+  for (const s of await webSearch(page, startU.hostname)) {
+    let u;
+    try { u = new URL(s.url); } catch { continue; }
+    const ls = linkScore(s.text, u);
+    add(s.url, Math.max(ls.score, 0) + 3, `a web search (${s.engine})`, [`search result "${s.text.slice(0, 60)}"`, ...ls.why]);
+  }
+  for (const u of await guessedSubmitUrls(page, origin, tried)) add(u, 3, 'a common submit address', ['answers with a form']);
+  // Read the best candidates not read yet, so the final choice is based on what the pages contain.
+  for (const c of ranked().filter((x) => !x.read).slice(0, 10)) {
+    c.read = true;
+    const res = await fetchPage(page, c.url);
+    if (!res || res.status >= 400) { if (res && res.status >= 400) c.score -= 5; continue; }
+    const a = await analyzeHtml(page, res.html, res.url);
+    if (a) { const ps = pageScore(a); c.score += ps.score; c.why.push(...ps.why); }
+    await sleep(300);
+  }
+  if ((r = await confirm(1, CONFIRM_BUDGET))) return found(r);
+  if (fallback && (await openAndCheck(page, fallback.url))) return found(fallback);
+  await step(j, `No listing page confirmed out of ${cands.size} page(s) considered`, 'warn', { candidates: summary([...cands.values()].sort((a, b) => b.score - a.score)) });
   await page.goto(start, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
   return null;
 }
@@ -595,6 +808,31 @@ function plainError(m) {
   return hit ? `${hit[1]} (${m.slice(0, 120)})` : m;
 }
 
+// "Find listing pages only": search the site and save its listing page, without signing up or submitting anything.
+const PAGE_KIND_TEXT = {
+  form: 'a listing form', maybe: 'a form without a website field', login: 'it needs an account (login or sign-up)',
+  start: 'it starts with a mobile number or email sign-up',
+};
+async function findOnly(j, page) {
+  let target = null;
+  if (j.submitUrl) {
+    const kind = await openAndCheck(page, j.submitUrl);
+    if (kind) target = { url: j.submitUrl, kind, via: 'the page saved for this site' };
+    else {
+      await step(j, `The saved listing page ${j.submitUrl} shows no form now; searching the site again`, 'warn');
+      await page.goto(j.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    }
+  }
+  if (!target) target = await findSubmitPage(j, page);
+  await screenshot(j, page);
+  if (!target) {
+    const text = 'No listing page found. Open the site, find where businesses are added and set it with the pencil button in the Sites tab.';
+    return setJob(j, { status: 'notfound', note: text, log: { text, kind: 'warn' } });
+  }
+  const text = `Listing page found via ${target.via}: ${target.url} (${PAGE_KIND_TEXT[target.kind] || 'a form'})`;
+  return setJob(j, { status: 'found', note: text, submitUrl: target.url, log: { text, kind: 'ok' } });
+}
+
 // ---- One site -----------------------------------------------------------------
 async function processJob(ctx, { job: j, client, account }) {
   let acct = account;
@@ -609,6 +847,7 @@ async function processJob(ctx, { job: j, client, account }) {
     const res = await page.goto(j.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await step(j, `Opened "${((await page.title().catch(() => '')) || page.url()).slice(0, 90)}"${res ? ` (HTTP ${res.status()})` : ''}`);
     if ((a = await checkpoint(j, page, 'landing page')) !== 'continue') return ended(a);
+    if (j.mode === 'find') return await findOnly(j, page);
 
     // 1) A saved account: log in now, so member-only listing links show up.
     if (acct) {
@@ -622,7 +861,10 @@ async function processJob(ctx, { job: j, client, account }) {
     if (j.submitUrl) {
       const kind = await openAndCheck(page, j.submitUrl);
       if (kind) target = { url: j.submitUrl, kind, via: 'the page saved for this site' };
-      else await step(j, `The saved listing page ${j.submitUrl} shows no form now; searching the site again`, 'warn');
+      else {
+        await step(j, `The saved listing page ${j.submitUrl} shows no form now; searching the site again`, 'warn');
+        await page.goto(j.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      }
     }
     if (!target) target = await findSubmitPage(j, page);
     if (target) await step(j, `Listing page found via ${target.via}: ${target.url}`, 'ok', { kind: target.kind });

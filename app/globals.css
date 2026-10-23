@@ -275,6 +275,8 @@ table.mini td small { display: block; color: var(--muted); font-size: 11px; }
 .listing-edit { margin-top: 6px; }
 .listing-edit input { flex: 1; min-width: 220px; }
 .pill.skipped { background: var(--surface-2); color: var(--muted); }
+.pill.found { background: var(--ok-soft); color: var(--ok-ink); border-color: transparent; }
+.pill.notfound { background: var(--warn-soft); color: var(--warn-ink); border-color: transparent; }
 
 .card.needs {
   display: flex; gap: 16px; border-color: color-mix(in srgb, var(--warn) 45%, transparent);

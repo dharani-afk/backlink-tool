@@ -37,8 +37,24 @@ When a site needs a person (CAPTCHA, email verification, a form it doesn't under
 
 ### Modes
 
-- **Review before each submit** (recommended): fills the form, then waits for a person to check it.
-- **Fully automatic submit**: presses Submit by itself; pauses only for CAPTCHAs, email verification or unknown forms.
+- **Review each submit** (recommended): fills the form, then waits for a person to check it.
+- **Fully automatic**: presses Submit by itself; pauses only for CAPTCHAs, email verification or unknown forms.
+- **Find listing pages only**: searches each site and saves its listing page, without signing up or submitting anything. Use it first on a new list of sites, check the results in the Sites tab, then run the submissions.
+
+### How the runner finds a site's listing page
+
+It works like a small search agent in the runner's Chrome (no AI service or API key needed):
+
+1. The page saved for the site (found earlier, or set by hand with the pencil button in the Sites tab).
+2. A short built-in list of known directories (`KNOWN_LISTING_PAGES` in `runner/runner.js`).
+3. The links on the site as Chrome shows it, menus and footers included, ranked by their text and address ("Free listing", "List your business", "Sell on…", `/add-listing`).
+4. Buttons that open a listing pop-up.
+5. Exploring: it reads the most promising pages without opening them and follows their links, so pages two or three clicks deep ("For business" > "Plans" > "Get started") are found.
+6. The sitemap: `robots.txt`, sitemap indexes, `.xml.gz` sitemaps and HTML "site map" pages, scored by the words in each address.
+7. A web search for the site's own listing page (DuckDuckGo, then Bing), read from the public result pages.
+8. The usual submit addresses (`/submit`, `/add-listing`, `/list-your-business`…).
+
+Every candidate is scored from its link text, address, page title, headings and form (a form with business-name and website fields scores highest; a login wall or mobile-number sign-up counts as the way in). The best candidates are then opened in Chrome to confirm. The job details show the pages it considered, their scores and why it chose one.
 
 ### Results
 

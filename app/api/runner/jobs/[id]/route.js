@@ -1,7 +1,7 @@
 import { q } from '@/lib/db';
 import { runner } from '@/lib/auth';
 
-const STATUSES = ['running', 'needs_help', 'submitted', 'unconfirmed', 'skipped', 'failed'];
+const STATUSES = ['running', 'needs_help', 'submitted', 'unconfirmed', 'skipped', 'failed', 'found', 'notfound'];
 const MAX_LOG = 300;
 
 // Runner progress report and heartbeat. With takeAction it also collects (and clears) a

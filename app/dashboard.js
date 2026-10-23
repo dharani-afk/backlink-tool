@@ -18,7 +18,13 @@ const SECTIONS = [
 const FIELDS = SECTIONS.flatMap(([, f]) => f);
 const EMPTY = Object.fromEntries(FIELDS.map(([k]) => [k, '']));
 const ACTIVE = ['pending', 'running', 'needs_help'];
-const STATUS_LABEL = { pending: 'Queued', running: 'Running', needs_help: 'Needs you', submitted: 'Submitted', unconfirmed: 'Unconfirmed', failed: 'Failed', skipped: 'Skipped' };
+const STATUS_LABEL = { pending: 'Queued', running: 'Running', needs_help: 'Needs you', submitted: 'Submitted', unconfirmed: 'Unconfirmed', failed: 'Failed', skipped: 'Skipped', found: 'Listing page found', notfound: 'Not found' };
+const MODE_LABEL = { review: 'Review each submit', auto: 'Fully automatic', find: 'Find listing pages only' };
+const MODE_HINT = {
+  review: 'Recommended. Fills the form, then waits for you to check it.',
+  auto: 'Presses Submit itself; still pauses for CAPTCHAs and email checks.',
+  find: 'Searches each site (links, a crawl, sitemap, web search) and saves its listing page. Never signs up or submits.',
+};
 
 async function api(p, o = {}) {
   const r = await fetch('/api' + p, Object.assign({ headers: { 'Content-Type': 'application/json' } }, o));
@@ -300,19 +306,20 @@ function Run({ clients, sites, jobs, runners, runnerInfo, help, reload, notify, 
   const shownSites = sites.filter((s) => s.url.toLowerCase().includes(query.toLowerCase()));
 
   const counts = useMemo(() => {
-    const c = { pending: 0, running: 0, needs_help: 0, submitted: 0, unconfirmed: 0, failed: 0, skipped: 0 };
+    const c = { pending: 0, running: 0, needs_help: 0, submitted: 0, unconfirmed: 0, failed: 0, skipped: 0, found: 0, notfound: 0 };
     for (const j of jobs) c[j.status] = (c[j.status] || 0) + 1;
     return c;
   }, [jobs]);
   const active = counts.pending + counts.running + counts.needs_help;
   const filters = [['all', 'All', jobs.length], ['active', 'Active', active], ['needs_help', 'Needs you', counts.needs_help],
-    ['submitted', 'Submitted', counts.submitted], ['unconfirmed', 'Unconfirmed', counts.unconfirmed], ['failed', 'Failed', counts.failed], ['skipped', 'Skipped', counts.skipped]];
+    ['submitted', 'Submitted', counts.submitted], ['unconfirmed', 'Unconfirmed', counts.unconfirmed], ['failed', 'Failed', counts.failed], ['skipped', 'Skipped', counts.skipped],
+    ['found', 'Listing page found', counts.found], ['notfound', 'Not found', counts.notfound]].filter(([k, , n]) => n || !['found', 'notfound'].includes(k));
   const shownJobs = jobs.filter((j) => filter === 'all' || (filter === 'active' ? ACTIVE.includes(j.status) : j.status === filter));
 
   function toggle(id) { const n = new Set(off); n.has(id) ? n.delete(id) : n.add(id); setOff(n); }
   async function start() {
     setStarting(true);
-    const r = await post('/run', { clientId: cid, siteIds: selected.map((s) => s.id), reviewMode: mode === 'review' }).finally(() => setStarting(false));
+    const r = await post('/run', { clientId: cid, siteIds: selected.map((s) => s.id), mode }).finally(() => setStarting(false));
     if (r.error) return notify(r.error, 'bad');
     const plural = (n) => `${n} site${n === 1 ? '' : 's'}`;
     if (!r.queued) notify(`Nothing new queued: ${plural(r.alreadyQueued)} already queued or running for this client`, 'bad');
@@ -367,10 +374,9 @@ function Run({ clients, sites, jobs, runners, runnerInfo, help, reload, notify, 
                 {clients.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}</select></div>
             <div className="field"><label>Mode</label>
               <div className="segmented">
-                <button className={mode === 'review' ? 'on' : ''} onClick={() => setMode('review')}>Review each submit</button>
-                <button className={mode === 'auto' ? 'on' : ''} onClick={() => setMode('auto')}>Fully automatic</button>
+                {Object.entries(MODE_LABEL).map(([k, l]) => <button key={k} className={mode === k ? 'on' : ''} onClick={() => setMode(k)}>{l}</button>)}
               </div>
-              <small className="hint">{mode === 'review' ? 'Recommended. Fills the form, then waits for you to check it.' : 'Presses Submit itself; still pauses for CAPTCHAs and email checks.'}</small></div>
+              <small className="hint">{MODE_HINT[mode]}</small></div>
           </div>
           <div className="field site-pick">
             <div className="row spread">
@@ -388,7 +394,7 @@ function Run({ clients, sites, jobs, runners, runnerInfo, help, reload, notify, 
           <div className="action-bar">
             <button className="btn danger-ghost" onClick={() => act('/run/stop', 'Stopping run')} disabled={!active}><Icon name="stop" />Stop</button>
             <span className="grow" />
-            <button className="btn primary lg" onClick={start} disabled={!selected.length || starting}><Icon name="play" />{starting ? 'Queueing…' : `Start run · ${selected.length} site${selected.length === 1 ? '' : 's'}`}</button>
+            <button className="btn primary lg" onClick={start} disabled={!selected.length || starting}><Icon name="play" />{starting ? 'Queueing…' : `${mode === 'find' ? 'Find listing pages' : 'Start run'} · ${selected.length} site${selected.length === 1 ? '' : 's'}`}</button>
           </div>
         </>)}
       </section>
@@ -436,12 +442,13 @@ function JobDetails({ id, close }) {
   }, [id, close]);
   const log = d?.log || [];
   const fieldSteps = log.filter((s) => s.data?.fields?.length);
+  const searchSteps = log.filter((s) => s.data?.candidates?.length);
   return (
     <div className="overlay" onClick={(e) => { if (e.target === e.currentTarget) close(); }}>
       <aside className="drawer" role="dialog" aria-label="Job details">
         <div className="drawer-head">
           <div><h2>{d ? hostOf(d.url) : 'Loading…'}</h2>
-            {d && <p className="muted">{d.clientName} · {d.reviewMode ? 'Review each submit' : 'Fully automatic'}{d.runner ? ` · Chrome on ${d.runner}` : ''}</p>}</div>
+            {d && <p className="muted">{d.clientName} · {MODE_LABEL[d.mode] || MODE_LABEL.review}{d.runner ? ` · Chrome on ${d.runner}` : ''}</p>}</div>
           <button className="btn icon-only ghost" title="Close" onClick={close}><Icon name="x" /></button>
         </div>
         {d && !d.error && (<div className="drawer-body">
@@ -456,6 +463,12 @@ function JobDetails({ id, close }) {
             <div key={i}><h3>{s.text}</h3>
               <table className="mini"><thead><tr><th>Field on the site</th><th>Filled with</th></tr></thead>
                 <tbody>{s.data.fields.map((f, k) => <tr key={k}><td>{f.field}<small>{f.as}</small></td><td>{f.value}</td></tr>)}</tbody></table></div>))}
+          {searchSteps.map((s, i) => (
+            <div key={'c' + i}><h3>Pages it considered: {s.text}</h3>
+              <table className="mini"><thead><tr><th>Page</th><th>Score</th><th>Why</th></tr></thead>
+                <tbody>{s.data.candidates.map((c, k) => (
+                  <tr key={k}><td><a href={c.url} target="_blank" rel="noreferrer">{c.url.replace(/^https?:\/\/(www\.)?/, '')}</a><small>via {c.via}</small></td>
+                    <td className="nowrap">{c.score}</td><td>{c.why || <span className="muted">-</span>}</td></tr>))}</tbody></table></div>))}
           <h3>What happened</h3>
           {log.length ? <ol className="timeline">{log.map((s, i) => (
             <li key={i} className={s.kind}><span className="dot"><Icon name={STEP_ICON[s.kind] || 'play'} size={12} /></span>

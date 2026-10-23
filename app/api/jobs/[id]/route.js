@@ -7,7 +7,7 @@ import { hostOf } from '@/lib/util';
 export const GET = team(async (req, { params }) => {
   const { id } = await params;
   const [j] = await q(`select j.id, j.client_id, j.client_name as "clientName", j.url, j.status, j.note, j.runner,
-      j.review_mode as "reviewMode", j.has_shot as "hasShot", j.updated_at as "updatedAt", j.log,
+      j.review_mode as "reviewMode", coalesce(j.mode, case when j.review_mode then 'review' else 'auto' end) as mode, j.has_shot as "hasShot", j.updated_at as "updatedAt", j.log,
       s.submit_url as "submitUrl"
     from jobs j left join sites s on s.id = j.site_id where j.id = $1`, [id]);
   if (!j) return Response.json({ error: 'not found' }, { status: 404 });
