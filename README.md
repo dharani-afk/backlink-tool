@@ -42,9 +42,14 @@ When a site needs a person (CAPTCHA, email verification, a form it doesn't under
 
 ### Results
 
-- **submitted**: the site showed a confirmation message. Check that the listing goes live; many directories review submissions first.
-- **unconfirmed**: Submit was pressed but no confirmation appeared. Check the screenshot.
-- **failed**: the site couldn't be opened, or the runner stopped responding for 2 minutes (window closed, PC asleep, connection lost).
+Click any job (or **What it did** on a *Needs you* card) to see everything the runner did on that site: each step with its time, whether it signed up or logged in (and as whom), the listing page and how it was found, every field it filled and with what, the evidence for the result, and the latest screenshot.
+
+- **submitted**: after Submit, the site showed a *new* confirmation message (quoted in the note) or moved to a thank-you page. Text that was already on the page never counts. Check that the listing goes live; many directories review submissions first.
+- **unconfirmed**: Submit was pressed but no confirmation appeared, or the site showed an error (quoted in the note), or no field matched the client's details. Check the screenshot.
+- **skipped**: the note says why: a team member pressed Skip, the run was stopped, or nobody responded for 30 minutes.
+- **failed**: the site couldn't be opened (the note says why in plain words), or the runner stopped responding for 2 minutes (window closed, PC asleep, connection lost).
+
+Pressing **Start run** again never queues a site twice: sites already queued or running for that client are left out. When the runner cannot find a site's listing page, open it in Chrome (in any tab) and press **Continue**; that page is saved for the site. You can also set or clear a site's listing page by hand with the pencil button in the **Sites** tab.
 
 ## Limits
 

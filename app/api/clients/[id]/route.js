@@ -1,6 +1,6 @@
 import { q } from '@/lib/db';
 import { team } from '@/lib/auth';
-import { CLIENT_FIELDS } from '@/lib/util';
+import { CLIENT_FIELDS, normalizeClient } from '@/lib/util';
 
 export const PUT = team(async (req, { params }) => {
   const { id } = await params;
@@ -10,6 +10,8 @@ export const PUT = team(async (req, { params }) => {
   const c = row.data;
   for (const f of CLIENT_FIELDS) if (f in body) c[f] = (body[f] || '').toString();
   if (!c.name || !c.url) return Response.json({ error: 'name and url are required' }, { status: 400 });
+  const errors = normalizeClient(c);
+  if (errors.length) return Response.json({ error: errors.join('. ') }, { status: 400 });
   await q('update clients set data = $2::text::jsonb where id = $1', [id, JSON.stringify(c)]);
   return Response.json({ ...c, id });
 });

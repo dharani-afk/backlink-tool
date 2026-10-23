@@ -55,22 +55,47 @@ async function setJob(j, patch) {
   try { return await api(`/jobs/${j.id}`, patch); } catch (e) { if (e.fatal) throw e; log('Could not reach dashboard:', e.message); }
 }
 
-// Pause this job until a person clicks Continue or Skip in the dashboard.
+// One step of the job's record, shown in the dashboard's job details. kind: info, ok, warn, bad, person.
+// The note (the job's one-line status) follows the latest step unless the patch sets its own.
+function step(j, text, kind = 'info', data, patch = {}) {
+  return setJob(j, { note: text, ...patch, log: { text, kind, data } });
+}
+
+// Why a pause ended, as the note the site gets when it does not continue.
+const ENDED = {
+  skip: 'Skipped: a team member pressed Skip',
+  stop: 'Skipped: the run was stopped',
+  timeout: `Skipped: nobody responded for ${HUMAN_TIMEOUT_MS / 60000} minutes`,
+  closed: 'Skipped: the job was closed from the dashboard',
+};
+
+// Pause this job until a person clicks Continue or Skip in the dashboard (or the run is stopped).
+// Returns 'continue', 'skip', 'stop', 'timeout' or 'closed'.
 async function waitForHuman(j, page, reason) {
-  await setJob(j, { status: 'needs_help', note: reason });
+  await screenshot(j, page);
+  await step(j, reason, 'person', undefined, { status: 'needs_help' });
   page.bringToFront().catch(() => {});
   const until = Date.now() + HUMAN_TIMEOUT_MS;
   while (Date.now() < until) {
     await sleep(2000);
     const r = await setJob(j, { takeAction: true });
     if (!r) continue;
-    if (r.action) {
-      if (r.action !== SKIP) await setJob(j, { status: 'running', note: 'Continuing' });
-      return r.action;
+    if (r.action === 'continue') {
+      await step(j, 'A team member pressed Continue', 'person', undefined, { status: 'running' });
+      return 'continue';
     }
-    if (r.status !== 'needs_help') return SKIP; // closed from the dashboard
+    if (r.action) return r.action === SKIP ? 'skip' : r.action;
+    if (r.status !== 'needs_help') return 'closed';
   }
-  return SKIP;
+  return 'timeout';
+}
+
+// The tab the person was working in: the newest open tab of this Chrome window (sites often open
+// their sign-up or listing form in a new tab). Throws if every tab of the job was closed.
+function latestPage(page) {
+  const open = page.context().pages().filter((p) => !p.isClosed());
+  if (!open.length) throw new Error('The Chrome tab for this site was closed');
+  return open[open.length - 1];
 }
 
 async function hasCaptcha(page) {
@@ -89,26 +114,44 @@ async function hasCaptcha(page) {
 }
 
 async function checkpoint(j, page, where) {
-  // Pause for a person if a CAPTCHA is on screen. Returns false if the person skipped the site.
+  // Pause for a person if a CAPTCHA is on screen. Returns 'continue' or why the site ended.
   // A solved CAPTCHA widget usually stays on the page, so once the person clicks Continue we trust them.
-  if (!(await hasCaptcha(page))) return true;
+  if (!(await hasCaptcha(page))) return 'continue';
   const a = await waitForHuman(j, page, `CAPTCHA at ${where}. Solve it in the open Chrome window, then click Continue.`);
   await sleep(800);
-  return a !== SKIP;
+  return a;
 }
 
 // ---- Form filling -------------------------------------------------------------
+// A web address for a URL field, or '' when the client's value is not one (older profiles may hold
+// plain text there; the dashboard now rejects that, but such a value must never be typed into a site).
+function asUrl(v) {
+  v = String(v || '').trim();
+  if (!v) return '';
+  if (!/^https?:\/\//i.test(v)) v = 'https://' + v;
+  try { const u = new URL(v); return !/\s/.test(v) && u.hostname.includes('.') ? v : ''; } catch { return ''; }
+}
+
 function buildValues(client, account) {
   return {
     email: account.email, password: account.password, username: account.username,
-    name: client.name, url: client.url, tagline: client.tagline || client.shortDesc,
+    name: client.name, url: asUrl(client.url), tagline: client.tagline || client.shortDesc,
     shortDesc: client.shortDesc || client.tagline, longDesc: client.longDesc || client.shortDesc,
     keywords: client.keywords, category: client.category, phone: client.phone,
     address: client.address, city: client.city, country: client.country,
-    logoUrl: client.logoUrl, facebook: client.facebook, twitter: client.twitter,
-    linkedin: client.linkedin, instagram: client.instagram,
+    logoUrl: asUrl(client.logoUrl), facebook: asUrl(client.facebook), twitter: asUrl(client.twitter),
+    linkedin: asUrl(client.linkedin), instagram: asUrl(client.instagram),
   };
 }
+
+// Field names as shown in the job details.
+const KEY_LABEL = {
+  email: 'Email', password: 'Password', username: 'Username', name: 'Business name', url: 'Website', tagline: 'Tagline',
+  shortDesc: 'Short description', longDesc: 'Description', keywords: 'Keywords', category: 'Category', phone: 'Phone',
+  address: 'Address', city: 'City', country: 'Country', logoUrl: 'Logo URL', facebook: 'Facebook', twitter: 'Twitter / X',
+  linkedin: 'LinkedIn', instagram: 'Instagram',
+};
+const shown = (key, v) => (key === 'password' ? '•'.repeat(10) : String(v).length > 80 ? String(v).slice(0, 77) + '...' : String(v));
 
 function classify(info) {
   const hint = [info.name, info.id, info.ph, info.aria, info.label].join(' ').toLowerCase();
@@ -136,37 +179,66 @@ function classify(info) {
 
 const SKIP_TYPES = ['hidden', 'submit', 'button', 'checkbox', 'radio', 'file', 'search', 'image', 'reset'];
 
-async function fillForm(page, values) {
-  let filled = 0;
-  const els = await page.locator('input:visible, textarea:visible, select:visible').all();
-  for (const el of els) {
-    let info;
-    try {
-      info = await el.evaluate((e) => ({
-        tag: e.tagName.toLowerCase(), type: (e.type || '').toLowerCase(), name: e.name || '', id: e.id || '',
+// Every visible field on the page, tagged (data-bt-field / data-bt-group) so it can be found again,
+// with the form it belongs to. Search boxes are marked so they are never filled.
+async function scanFields(page) {
+  return page.evaluate(() => {
+    const visible = (e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'; };
+    const forms = [...document.forms];
+    return [...document.querySelectorAll('input, textarea, select')].filter(visible).map((e, i) => {
+      e.setAttribute('data-bt-field', String(i));
+      const form = e.closest('form');
+      const hint = [e.name, e.id, e.placeholder, e.getAttribute('aria-label'), e.labels && e.labels[0] ? e.labels[0].innerText : ''].join(' ');
+      const search = e.type === 'search' || !!e.closest('[role="search"], form[role="search"], form[action*="search" i]')
+        || /\bsearch|\bq\b|^q$|find (a |an )?(product|business|service)|what are you looking/i.test(hint) || e.name === 'q';
+      return {
+        i, tag: e.tagName.toLowerCase(), type: (e.type || '').toLowerCase(), name: e.name || '', id: e.id || '',
         ph: e.placeholder || '', aria: e.getAttribute('aria-label') || '',
-        label: e.labels && e.labels[0] ? e.labels[0].innerText : '', value: e.value || '',
-        readOnly: !!e.readOnly || !!e.disabled,
-      }));
-    } catch { continue; }
-    if (SKIP_TYPES.includes(info.type)) continue;
-    if (info.readOnly || (info.value && info.tag !== 'select')) continue;
-    const key = classify(info);
-    const val = key && values[key];
+        label: e.labels && e.labels[0] ? e.labels[0].innerText.trim() : '', value: e.value || '',
+        readOnly: !!e.readOnly || !!e.disabled, search, group: form ? forms.indexOf(form) : -1,
+      };
+    });
+  }).catch(() => []);
+}
+
+// Fill the client's details into the page's best form: the one with the most fields we understand
+// (a site's header search or newsletter box never wins over the real listing form). The chosen form is
+// marked data-bt-form="1" so pressSubmit presses that form's button. Returns { count, fields, group }.
+async function fillForm(page, values) {
+  const infos = (await scanFields(page)).filter((f) => !SKIP_TYPES.includes(f.type) && !f.search);
+  const groups = new Map();
+  for (const f of infos) {
+    f.key = classify(f);
+    if (!f.key) continue;
+    groups.set(f.group, (groups.get(f.group) || 0) + 1);
+  }
+  if (!groups.size) return { count: 0, fields: [], group: null };
+  const group = [...groups].sort((a, b) => b[1] - a[1])[0][0];
+  await page.evaluate((g) => {
+    document.querySelectorAll('[data-bt-form]').forEach((e) => e.removeAttribute('data-bt-form'));
+    if (g >= 0 && document.forms[g]) document.forms[g].setAttribute('data-bt-form', '1');
+  }, group).catch(() => {});
+  const fields = [];
+  for (const f of infos) {
+    if (f.group !== group || !f.key || f.readOnly || (f.value && f.tag !== 'select')) continue;
+    const val = values[f.key];
     if (!val) continue;
+    const el = page.locator(`[data-bt-field="${f.i}"]`);
     try {
-      if (info.tag === 'select') {
+      if (f.tag === 'select') {
         const opts = await el.evaluate((e) => [...e.options].map((o) => ({ v: o.value, t: o.text })));
         const want = String(val).toLowerCase();
-        const m = opts.find((o) => o.t.toLowerCase().includes(want) || want.includes(o.t.toLowerCase().trim()) && o.t.trim());
-        if (m) { await el.selectOption(m.v); filled++; }
+        const m = opts.find((o) => o.t.trim() && (o.t.toLowerCase().includes(want) || want.includes(o.t.toLowerCase().trim())));
+        if (!m) continue;
+        await el.selectOption(m.v);
+        fields.push({ field: f.label || f.ph || f.name || KEY_LABEL[f.key], as: KEY_LABEL[f.key], value: m.t.trim() });
       } else {
         await el.fill(String(val));
-        filled++;
+        fields.push({ field: f.label || f.ph || f.aria || f.name || KEY_LABEL[f.key], as: KEY_LABEL[f.key], value: shown(f.key, val) });
       }
     } catch {}
   }
-  return filled;
+  return { count: fields.length, fields, group };
 }
 
 async function clickByText(page, regex, scopeSel = 'a, button') {
@@ -189,16 +261,62 @@ async function hasPasswordField(page) {
   return (await page.locator('input[type="password"]:visible').count()) > 0;
 }
 
+const SUBMIT_TEXT = /^(submit|add|list|send|save|create|register|sign ?up|post|continue|next|get started|join|publish|done|finish)\b/i;
+const SEARCH_TEXT = /^(search|go|find)$/i;
+
+// Press the submit button of the form fillForm filled (data-bt-form), falling back to a submit-looking
+// button elsewhere on the page, never a search button. Returns the button's text, or null if none was found.
 async function pressSubmit(page) {
-  const direct = page.locator('button[type="submit"]:visible, input[type="submit"]:visible').first();
-  try {
-    if (await direct.count()) { await direct.click({ timeout: 5000 }); return true; }
-  } catch {}
-  return !!(await clickByText(page, /^(submit|add|list|send|save|create|register|sign ?up|post|continue|next)\b/i, 'button, input[type="button"]'));
+  const label = async (b) => ((await b.innerText().catch(() => '')) || (await b.getAttribute('value').catch(() => '')) || '').trim();
+  const tryClick = async (sel, needsText) => {
+    for (const b of await page.locator(sel).all()) {
+      try {
+        if (!(await b.isVisible())) continue;
+        const t = await label(b);
+        if (SEARCH_TEXT.test(t) || (needsText && !SUBMIT_TEXT.test(t))) continue;
+        await b.click({ timeout: 5000 });
+        await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
+        return t || 'Submit';
+      } catch {}
+    }
+    return null;
+  };
+  return (await tryClick('[data-bt-form] button[type="submit"], [data-bt-form] input[type="submit"], [data-bt-form] button:not([type])', false))
+    || (await tryClick('[data-bt-form] button, [data-bt-form] input[type="button"], [data-bt-form] [role="button"]', true))
+    || (await tryClick('button[type="submit"], input[type="submit"]', false))
+    || (await tryClick('button, input[type="button"], [role="button"]', true));
 }
 
 async function bodyText(page) {
   return ((await page.locator('body').innerText().catch(() => '')) || '').toLowerCase();
+}
+
+// What the page says after Submit compared with before it, so words that were already on the page
+// ("success stories" in a menu, "thank you" in a footer) never count as a confirmation.
+const SUCCESS = /thank(s| you)|successfully|has been (submitted|received|added|created|listed|sent|saved|registered)|we (have )?received|submission (received|complete)|under review|pending (review|approval|moderation)|awaiting (approval|review|moderation)|listing (is )?(live|created|submitted)|registration (successful|complete)|congratulations/i;
+const PROBLEM = /(is|are) required|required field|please (enter|fill|select|provide|correct|check)|invalid|not valid|already (exists|registered|taken|in use)|error|failed|try again|incorrect/i;
+const OTP = /\botp\b|one.?time (password|code)|verification code|enter (the )?code|code (has been |was )?sent/i;
+async function pageState(page) {
+  return { url: page.url(), text: (await page.locator('body').innerText().catch(() => '')) || '' };
+}
+function newMatch(before, after, re) {
+  const lines = after.text.split(/\n+/).map((l) => l.trim()).filter(Boolean);
+  const old = new Set(before.text.split(/\n+/).map((l) => l.trim()));
+  const line = lines.find((l) => re.test(l) && !old.has(l) && l.length < 300);
+  return line ? line.slice(0, 160) : null;
+}
+function submitOutcome(before, after) {
+  const moved = after.url !== before.url;
+  const success = newMatch(before, after, SUCCESS);
+  if (success) return { result: 'success', evidence: `The site showed: "${success}"` };
+  if (moved && /thank|success|confirm|submitted|complete|done|received/i.test(new URL(after.url).pathname + new URL(after.url).search)) {
+    return { result: 'success', evidence: `The site moved to a confirmation page: ${after.url}` };
+  }
+  const otp = newMatch(before, after, OTP);
+  if (otp) return { result: 'otp', evidence: `The site asks for a code: "${otp}"` };
+  const problem = newMatch(before, after, PROBLEM);
+  if (problem) return { result: 'problem', evidence: `The site showed: "${problem}"` };
+  return { result: 'unknown', evidence: moved ? `The site moved to ${after.url} without a confirmation message` : 'The page did not change after Submit' };
 }
 
 async function screenshot(j, page) {
@@ -232,14 +350,8 @@ const siteBase = (h) => h.replace(/^www\./, '').split('.').slice(-2).join('.');
 // the first step of many sign-ups that continue with an OTP), or null.
 async function pageKind(page) {
   if (await hasPasswordField(page)) return 'login';
-  const infos = await page.$$eval('input, textarea, select', (els) => els
-    .filter((e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden'; })
-    .map((e) => ({
-      tag: e.tagName.toLowerCase(), type: (e.type || '').toLowerCase(), name: e.name || '', id: e.id || '',
-      ph: e.placeholder || '', aria: e.getAttribute('aria-label') || '',
-      label: e.labels && e.labels[0] ? e.labels[0].innerText : '', readOnly: !!e.readOnly || !!e.disabled,
-    }))).catch(() => []);
-  const keys = infos.filter((i) => !SKIP_TYPES.includes(i.type) && !i.readOnly).map(classify).filter(Boolean);
+  const infos = await scanFields(page);
+  const keys = infos.filter((i) => !SKIP_TYPES.includes(i.type) && !i.readOnly && !i.search).map(classify).filter(Boolean);
   if (keys.length < 3) return keys.includes('phone') || keys.includes('email') ? 'start' : null;
   return keys.includes('url') ? 'form' : 'maybe';
 }
@@ -351,7 +463,7 @@ async function openAndCheck(page, url) {
 // (a form on the page, its links, its buttons), then its sitemap, then the usual submit addresses.
 // Returns { url, kind, via } with kind 'form', 'login' (the listing page needs an account), 'maybe' or 'start', or null.
 async function findSubmitPage(j, page) {
-  await setJob(j, { note: 'Looking for where the site can be listed' });
+  await step(j, 'Looking for where the site can be listed');
   const start = page.url();
   if ((await pageKind(page)) === 'form') return { url: start, kind: 'form', via: 'the opened page' };
   const origin = new URL(start).origin;
@@ -381,7 +493,7 @@ async function findSubmitPage(j, page) {
     if (kind === 'form' || kind === 'login') return { url: page.url(), kind, via: 'a button on the site' };
   }
   // 3) The sitemap.
-  await setJob(j, { note: 'No listing link on the site, checking its sitemap' });
+  await step(j, 'No listing link or button on the site, checking its sitemap');
   for (const u of await sitemapSubmitUrls(page, origin, tried)) { const r = await visit(u, 'the sitemap'); if (r) return r; }
   // 4) The usual submit addresses.
   for (const u of await guessedSubmitUrls(page, origin, tried)) { const r = await visit(u, 'a common submit address'); if (r) return r; }
@@ -390,31 +502,45 @@ async function findSubmitPage(j, page) {
   return null;
 }
 
-// Log in with a saved account. Returns SKIP if the person skipped the site.
+const who = (acct) => acct.email || acct.username || 'the saved account';
+
+// Log in with a saved account. Returns 'ok', 'none' (no login form here) or why the site ended.
+// A login only counts as working when the password box is gone afterwards.
 async function logIn(j, page, client, acct) {
-  await setJob(j, { note: 'Logging in with saved account' });
-  if (!(await hasPasswordField(page))) await clickByText(page, /log ?in|sign ?in/i);
-  if (!(await hasPasswordField(page))) return;
+  if (!(await hasPasswordField(page))) await clickByText(page, /^(log ?in|sign ?in)\b/i);
+  if (!(await hasPasswordField(page))) return 'none';
+  await step(j, `Logging in as ${who(acct)}`);
+  const before = await pageState(page);
   await fillForm(page, buildValues(client, acct));
   await pressSubmit(page);
   await sleep(2500);
-  if (!(await checkpoint(j, page, 'login'))) return SKIP;
+  const cp = await checkpoint(j, page, 'login');
+  if (cp !== 'continue') return cp;
+  if (!(await hasPasswordField(page))) { await step(j, `Logged in as ${who(acct)}`, 'ok'); return 'ok'; }
+  const problem = newMatch(before, await pageState(page), PROBLEM);
+  await step(j, `Login did not work${problem ? `: the site showed "${problem}"` : ' (the login form is still showing)'}`, 'warn');
+  const a = await waitForHuman(j, page, `Login as ${who(acct)} did not work. Log in yourself in Chrome (or reset the password), then click Continue.`);
+  return a === 'continue' ? 'ok' : a;
 }
 
-// Create an account if the site offers sign-up. Returns the new account, SKIP, or nothing.
+// Create an account if the site offers sign-up. Returns the new account, null (no sign-up form),
+// or why the site ended (a string). The result of the sign-up is checked and recorded.
 async function signUp(j, page, client) {
   // On a login page, look for a sign-up link (links only, so a "Sign up" submit button is never pressed early).
   const scope = (await hasPasswordField(page)) ? 'a' : 'a, button';
   const clicked = await clickByText(page, /sign ?up|register|create (an |your )?account|join( now| free)?/i, scope);
   if (!clicked) {
-    if (scope === 'a, button') return;
+    if (scope === 'a, button') return null;
     // Already on a page with a password field: only treat it as sign-up if it looks like one, not a login form.
     const twoPasswords = (await page.locator('input[type="password"]:visible').count()) > 1;
-    if (!twoPasswords && !/sign ?up|register|create (an |your )?account/.test(await bodyText(page))) return;
+    if (!twoPasswords && !/sign ?up|register|create (an |your )?account/.test(await bodyText(page))) return null;
   }
-  if (!(await hasPasswordField(page))) return;
+  if (!(await hasPasswordField(page))) return null;
+  if (!client.email) {
+    await step(j, 'This site needs an account, but the client has no sign-up email', 'warn');
+    return null;
+  }
 
-  await setJob(j, { note: 'Signing up' });
   const acct = {
     email: client.email,
     password: genPassword(),
@@ -422,119 +548,192 @@ async function signUp(j, page, client) {
   };
   // Saved before submitting, so the password is never lost even if the page crashes after sign-up.
   await api('/accounts', { clientId: j.clientId, url: j.url, ...acct });
-  await fillForm(page, buildValues(client, acct));
+  await step(j, `Signing up as ${acct.email} (username ${acct.username}); the account is saved for this site`);
+  const before = await pageState(page);
+  const f = await fillForm(page, buildValues(client, acct));
+  await step(j, `Filled ${f.count} sign-up field(s)`, 'info', { fields: f.fields });
   if (j.reviewMode) {
     const a = await waitForHuman(j, page, 'Review the sign-up form (fix anything, solve any CAPTCHA), then click Continue to submit it.');
-    if (a === SKIP) return SKIP;
+    if (a !== 'continue') return a;
   }
   await pressSubmit(page);
   await sleep(3000);
-  if (!(await checkpoint(j, page, 'sign-up'))) return SKIP;
-  if (/verif|confirm.{0,20}e-?mail|check your (e-?)?mail|activation/.test(await bodyText(page))) {
-    const a = await waitForHuman(j, page, `Email verification needed for ${acct.email}. Open the verification email, click its link (in this Chrome window if possible), then click Continue.`);
-    if (a === SKIP) return SKIP;
+  const cp = await checkpoint(j, page, 'sign-up');
+  if (cp !== 'continue') return cp;
+  const after = await pageState(page);
+  const verify = newMatch(before, after, /verif|confirm.{0,20}e-?mail|check your (e-?)?mail|activation|\botp\b|verification code/i);
+  if (verify) {
+    await step(j, `Sign-up needs verification: the site showed "${verify}"`, 'warn');
+    const a = await waitForHuman(j, page, `Verification needed for ${acct.email} ("${verify}"). Open the email or SMS, finish the verification (in this Chrome window if possible), then click Continue.`);
+    if (a !== 'continue') return a;
     // Verification usually ends logged out, so start again from the site and log in.
     await page.goto(j.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    if ((await logIn(j, page, client, acct)) === SKIP) return SKIP;
+    const r = await logIn(j, page, client, acct);
+    if (!['ok', 'none'].includes(r)) return r;
+  } else if (await hasPasswordField(page)) {
+    const problem = newMatch(before, after, PROBLEM);
+    await step(j, `Sign-up did not seem to work${problem ? `: the site showed "${problem}"` : ' (the form is still showing)'}`, 'warn');
+    const a = await waitForHuman(j, page, `Sign-up as ${acct.email} did not seem to work${problem ? ` ("${problem}")` : ''}. Fix it in Chrome (or log in if the account already exists), then click Continue.`);
+    if (a !== 'continue') return a;
+  } else {
+    await step(j, `Signed up as ${acct.email}`, 'ok');
   }
   return acct;
+}
+
+// Browser errors in words a team member can act on (the original stays in brackets).
+function plainError(m) {
+  const known = [
+    [/ERR_NAME_NOT_RESOLVED/, 'this web address does not exist (check the site URL in the Sites tab)'],
+    [/ERR_CERT|SSL|certificate/i, 'the site\'s security certificate is broken, so Chrome will not open it'],
+    [/ERR_CONNECTION_(REFUSED|RESET|CLOSED)|ERR_EMPTY_RESPONSE/, 'the site refused the connection or is down'],
+    [/ERR_INTERNET_DISCONNECTED|ERR_NETWORK_CHANGED/, 'this PC lost its internet connection'],
+    [/Timeout \d+ms exceeded|timed? ?out/i, 'the site took too long to load'],
+    [/Target (page, context or browser )?(has been )?closed|tab for this site was closed|Browser has been closed/i, 'the Chrome window or tab was closed during the job'],
+  ];
+  const hit = known.find(([re]) => re.test(m));
+  return hit ? `${hit[1]} (${m.slice(0, 120)})` : m;
 }
 
 // ---- One site -----------------------------------------------------------------
 async function processJob(ctx, { job: j, client, account }) {
   let acct = account;
-  const skipped = (note = 'Skipped by user') => setJob(j, { status: 'skipped', note });
-
-  await setJob(j, { status: 'running', note: 'Opening site' });
-  const page = await ctx.newPage();
+  // Every way a site can end without a result says why, in the note and the job's record.
+  const ended = (a) => { const text = ENDED[a] || ENDED.closed; return setJob(j, { status: 'skipped', note: text, log: { text, kind: 'warn' } }); };
+  let page = await ctx.newPage();
   // Heartbeat so the dashboard knows this runner is still alive during long steps.
-  const beat = setInterval(() => api(`/jobs/${j.id}`, {}).catch(() => {}), 30000);
+  const beat = setInterval(() => api(`/jobs/${j.id}`, {}).catch(() => {}), 15000);
+  let a;
   try {
-    await page.goto(j.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    if (!(await checkpoint(j, page, 'landing page'))) return skipped();
+    await step(j, `Opening ${j.url}`, 'info', undefined, { status: 'running' });
+    const res = await page.goto(j.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await step(j, `Opened "${((await page.title().catch(() => '')) || page.url()).slice(0, 90)}"${res ? ` (HTTP ${res.status()})` : ''}`);
+    if ((a = await checkpoint(j, page, 'landing page')) !== 'continue') return ended(a);
 
-    // 1) Account: log in if we have one, otherwise sign up when the site offers it.
+    // 1) A saved account: log in now, so member-only listing links show up.
     if (acct) {
-      if ((await logIn(j, page, client, acct)) === SKIP) return skipped();
-    } else {
-      const r = await signUp(j, page, client);
-      if (r === SKIP) return skipped();
-      if (r) acct = r;
+      const r = await logIn(j, page, client, acct);
+      if (!['ok', 'none'].includes(r)) return ended(r);
+      if (r === 'none') await step(j, `Saved account ${who(acct)}: no login form on this page, will log in if the listing page asks`);
     }
 
-    // 2) Find the listing page: the one saved from an earlier run, otherwise search the site.
+    // 2) Find the listing page: the one saved for this site, otherwise search the site.
     let target = null;
     if (j.submitUrl) {
       const kind = await openAndCheck(page, j.submitUrl);
-      if (kind) target = { url: j.submitUrl, kind, via: 'the page saved from an earlier run' };
+      if (kind) target = { url: j.submitUrl, kind, via: 'the page saved for this site' };
+      else await step(j, `The saved listing page ${j.submitUrl} shows no form now; searching the site again`, 'warn');
     }
     if (!target) target = await findSubmitPage(j, page);
+    if (target) await step(j, `Listing page found via ${target.via}: ${target.url}`, 'ok', { kind: target.kind });
+    else await step(j, 'No listing page found automatically (checked links, buttons, sitemap and the usual submit addresses)', 'warn');
     // The listing page may sit behind a login, or the site may show its submit link only to members:
     // sign up or log in, then go back to the listing page (or search again).
     if ((await hasPasswordField(page)) || (!target && !acct)) {
       if (!(await hasPasswordField(page))) await page.goto(j.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
       if (acct) {
-        if ((await logIn(j, page, client, acct)) === SKIP) return skipped();
+        const r = await logIn(j, page, client, acct);
+        if (!['ok', 'none'].includes(r)) return ended(r);
       } else {
         const r = await signUp(j, page, client);
-        if (r === SKIP) return skipped();
+        if (typeof r === 'string') return ended(r);
         if (r) acct = r;
+        else await step(j, 'The site offers no sign-up form here');
       }
       if (target) {
         if (page.url() !== target.url) await openAndCheck(page, target.url);
       } else if (acct) {
         target = await findSubmitPage(j, page);
+        if (target) await step(j, `Listing page found via ${target.via}: ${target.url}`, 'ok', { kind: target.kind });
       }
     }
-    if (target) await setJob(j, { note: `Listing page${target.via ? ` (found via ${target.via})` : ''}: ${page.url()}` });
+
+    let byPerson = false; // the person opened the listing page themselves
     // Mobile-number (OTP) sign-ups need a person: put the number in, then let them finish in Chrome.
     if (target && (await pageKind(page)) === 'start') {
-      await fillForm(page, buildValues(client, acct || { email: client.email }));
+      const f = await fillForm(page, buildValues(client, acct || { email: client.email }));
+      await step(j, `This site starts with a mobile number or email sign-up; filled ${f.count} field(s)`, 'info', { fields: f.fields });
       await setJob(j, { submitUrl: target.url });
-      const a = await waitForHuman(j, page, 'This site lists businesses after a mobile number or email sign-up with an OTP. Finish the sign-up in Chrome and open the business details form, then click Continue.');
-      if (a === SKIP) return skipped();
+      if ((a = await waitForHuman(j, page, 'This site lists businesses after a mobile number or email sign-up with an OTP. Finish the sign-up in Chrome and open the business details form, then click Continue.')) !== 'continue') return ended(a);
+      page = latestPage(page);
+      byPerson = true;
     }
-    if (!(await checkpoint(j, page, 'submission page'))) return skipped();
+    if ((a = await checkpoint(j, page, 'submission page')) !== 'continue') return ended(a);
     if (await hasPasswordField(page)) {
-      const a = await waitForHuman(j, page, 'Still on a login or sign-up page. Log in or open the submit form in Chrome, then click Continue.');
-      if (a === SKIP) return skipped();
+      if ((a = await waitForHuman(j, page, 'Still on a login or sign-up page. Log in or open the submit form in Chrome, then click Continue.')) !== 'continue') return ended(a);
+      page = latestPage(page);
+      byPerson = true;
     }
 
     // 3) Fill the form.
-    await setJob(j, { note: 'Filling form' });
     const values = buildValues(client, acct || { email: client.email });
-    let filled = await fillForm(page, values);
-    if (filled === 0) {
+    let f = await fillForm(page, values);
+    if (!f.count) {
       // Many sites draw their form with JavaScript after the page loads; give it a moment.
       await sleep(4000);
-      filled = await fillForm(page, values);
+      f = await fillForm(page, values);
     }
-    if (filled === 0) {
-      const why = target ? 'Could not find a form I understand.' : 'Could not find where this site takes listings (checked its links, sitemap and the usual submit addresses).';
-      const a = await waitForHuman(j, page, `${why} Open the submit form in Chrome (fill it if you like), then click Continue. The page will be remembered for next time.`);
-      if (a === SKIP) return skipped();
-      filled = await fillForm(page, values);
+    if (!f.count) {
+      const why = target ? `The listing page has no form I understand (${page.url()}).` : 'Could not find where this site takes listings (checked its links, buttons, sitemap and the usual submit addresses).';
+      if ((a = await waitForHuman(j, page, `${why} In Chrome, open the page where the business details are entered (in any tab), then click Continue. That page will be remembered for this site.`)) !== 'continue') return ended(a);
+      page = latestPage(page);
+      byPerson = true;
+      f = await fillForm(page, values);
     }
-    // Remember the listing page so the next run for this site goes straight to it.
-    if (filled > 0 || ['form', 'maybe'].includes(await pageKind(page))) await setJob(j, { submitUrl: page.url() });
-
-    if (j.reviewMode) {
+    if (f.count) await step(j, `Filled ${f.count} field(s) on ${page.url()}`, 'ok', { fields: f.fields });
+    // Remember the listing page so the next run goes straight to it: the page the search found,
+    // or the page the person opened (only if it has a form, so a product or search page is never saved).
+    const saveUrl = byPerson ? page.url() : target && target.url;
+    if (saveUrl && saveUrl !== j.submitUrl && (f.count || ['form', 'maybe', 'start'].includes(await pageKind(page)))) {
+      await setJob(j, { submitUrl: saveUrl, log: { text: `Saved ${saveUrl} as this site's listing page`, kind: 'info' } });
+    }
+    if (!f.count) {
       await screenshot(j, page);
-      const a = await waitForHuman(j, page, `Filled ${filled} field(s). Review the form, then click Continue to let the tool press Submit (or press Submit yourself first).`);
-      if (a === SKIP) return skipped();
+      const text = 'Not submitted: no field on this page matched the client\'s details. If you filled and submitted it yourself in Chrome, check the listing; otherwise set the listing page in the Sites tab.';
+      return setJob(j, { status: 'unconfirmed', note: text, log: { text, kind: 'bad' } });
     }
-    await pressSubmit(page);
-    await sleep(3000);
-    if (!(await checkpoint(j, page, 'submit'))) return skipped();
+
+    // 4) Submit and check what the site says.
+    let before = await pageState(page);
+    let pressed = null;
+    if (j.reviewMode) {
+      if ((a = await waitForHuman(j, page, `Filled ${f.count} field(s) (see the job details). Review the form in Chrome, then click Continue to press Submit, or press Submit yourself first.`)) !== 'continue') return ended(a);
+      page = latestPage(page);
+      // The person may have pressed Submit already: the form we filled is gone, so do not press anything else.
+      if (!(await page.locator('[data-bt-field]').count().catch(() => 0))) pressed = 'pressed by the team member';
+      else before = await pageState(page);
+    }
+    if (!pressed) {
+      pressed = await pressSubmit(page);
+      if (!pressed) {
+        await step(j, 'Could not find the Submit button', 'warn');
+        if ((a = await waitForHuman(j, page, 'Could not find the Submit button. Press it yourself in Chrome, then click Continue.')) !== 'continue') return ended(a);
+        page = latestPage(page);
+        pressed = 'pressed by the team member';
+      }
+    }
+    await step(j, `Submit ${pressed.startsWith('pressed by') ? pressed : `pressed ("${pressed}")`}`);
+    await sleep(3500);
+    if ((a = await checkpoint(j, page, 'submit')) !== 'continue') return ended(a);
+    let out = submitOutcome(before, await pageState(page));
+    if (out.result === 'otp') {
+      if ((a = await waitForHuman(j, page, `${out.evidence}. Enter the code in Chrome and finish the submission, then click Continue.`)) !== 'continue') return ended(a);
+      page = latestPage(page);
+      out = submitOutcome(before, await pageState(page));
+      if (out.result === 'otp') out = { result: 'unknown', evidence: 'The site still shows the code step' };
+    }
     await screenshot(j, page);
-    if (/thank|received|submitted|success|under review|pending (review|approval)|has been (added|created|listed|sent)/.test(await bodyText(page))) {
-      await setJob(j, { status: 'submitted', note: `Submitted (${filled} fields filled). Check the listing goes live.` });
+    if (out.result === 'success') {
+      const text = `Submitted (${f.count} fields filled). ${out.evidence}`;
+      await setJob(j, { status: 'submitted', note: text, log: { text, kind: 'ok' } });
     } else {
-      await setJob(j, { status: 'unconfirmed', note: `Pressed Submit (${filled} fields filled) but the site showed no confirmation. Check the screenshot.` });
+      const text = `Not confirmed (${f.count} fields filled). ${/[.!?"]$/.test(out.evidence) ? out.evidence : out.evidence + '.'} Check the screenshot and the site.`;
+      await setJob(j, { status: 'unconfirmed', note: text, log: { text, kind: out.result === 'problem' ? 'bad' : 'warn' } });
     }
   } catch (e) {
     if (e.fatal) throw e;
-    await setJob(j, { status: 'failed', note: String(e.message || e).split('\n')[0] });
+    const text = `Failed: ${plainError(String(e.message || e).split('\n')[0])}`;
+    await setJob(j, { status: 'failed', note: text, log: { text, kind: 'bad' } });
   } finally {
     clearInterval(beat);
     await page.close().catch(() => {});

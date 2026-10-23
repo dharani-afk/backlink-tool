@@ -4,19 +4,21 @@ import Icon from './icons';
 
 const SECTIONS = [
   ['Basics', [
-    ['name', 'Business / product name'], ['url', 'Website URL'],
+    ['name', 'Business / product name'], ['url', 'Website URL', '', '', 'e.g. https://medkorse.in'],
     ['email', 'Sign-up email', '', '', 'A mailbox your team can read. Sites send verification links here.'], ['category', 'Category'],
     ['tagline', 'Tagline', 'full'], ['keywords', 'Keywords', 'full', '', 'Comma separated'],
   ]],
   ['Descriptions', [['shortDesc', 'Short description', 'full', 'textarea', 'About 150 characters'], ['longDesc', 'Long description', 'full', 'textarea']]],
   ['Contact & location', [['phone', 'Phone', '', '', 'Only used on forms that ask for it'], ['address', 'Address'], ['city', 'City'], ['country', 'Country']]],
-  ['Brand & social', [['logoUrl', 'Logo URL', 'full'], ['facebook', 'Facebook'], ['twitter', 'Twitter / X'], ['linkedin', 'LinkedIn'], ['instagram', 'Instagram']]],
+  ['Brand & social', [['logoUrl', 'Logo URL', 'full', '', 'A link to the logo image, e.g. https://example.com/logo.png. Leave empty if none.'],
+    ['facebook', 'Facebook', '', '', 'Page link, e.g. https://facebook.com/yourpage'], ['twitter', 'Twitter / X', '', '', 'e.g. https://x.com/yourname'],
+    ['linkedin', 'LinkedIn', '', '', 'e.g. https://linkedin.com/company/yourco'], ['instagram', 'Instagram', '', '', 'e.g. https://instagram.com/yourname']]],
   ['Internal', [['notes', 'Notes (not submitted anywhere)', 'full', 'textarea']]],
 ];
 const FIELDS = SECTIONS.flatMap(([, f]) => f);
 const EMPTY = Object.fromEntries(FIELDS.map(([k]) => [k, '']));
 const ACTIVE = ['pending', 'running', 'needs_help'];
-const STATUS_LABEL = { pending: 'Queued', running: 'Running', needs_help: 'Needs you', submitted: 'Submitted', unconfirmed: 'Unconfirmed', failed: 'Failed' };
+const STATUS_LABEL = { pending: 'Queued', running: 'Running', needs_help: 'Needs you', submitted: 'Submitted', unconfirmed: 'Unconfirmed', failed: 'Failed', skipped: 'Skipped' };
 
 async function api(p, o = {}) {
   const r = await fetch('/api' + p, Object.assign({ headers: { 'Content-Type': 'application/json' } }, o));
@@ -42,20 +44,22 @@ export default function Dashboard() {
   const [sites, setSites] = useState([]);
   const [jobs, setJobs] = useState([]);
   const [runners, setRunners] = useState([]);
+  const [runnerInfo, setRunnerInfo] = useState([]);
   const [toasts, setToasts] = useState([]);
   const [ready, setReady] = useState(false);
 
   const notify = useCallback((text, kind = 'ok') => {
     const id = Math.random();
     setToasts((t) => [...t, { id, text, kind }]);
-    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 3500);
+    // Problems stay long enough to read (they can be a few sentences).
+    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), kind === 'ok' ? 3500 : 9000);
   }, []);
 
   const loadClients = useCallback(async () => { const c = await api('/clients'); if (Array.isArray(c)) setClients(c); return c; }, []);
   const loadSites = useCallback(async () => { const s = await api('/sites'); if (Array.isArray(s)) setSites(s); }, []);
   const loadJobs = useCallback(async () => {
     const d = await api('/jobs');
-    if (d.jobs) { setJobs(d.jobs); setRunners(d.runners); }
+    if (d.jobs) { setJobs(d.jobs); setRunners(d.runners); setRunnerInfo(d.runnerInfo || []); }
   }, []);
 
   useEffect(() => {
@@ -92,8 +96,10 @@ export default function Dashboard() {
         <div className="sidebar-foot">
           <div className={'runner-status' + (runners.length ? ' on' : '')}>
             <span className="pulse" />
-            <div><strong>{runners.length ? 'Runner online' : 'No runner online'}</strong>
-              <small>{runners.length ? runners.join(', ') : 'Queued sites will wait'}</small></div>
+            <div><strong>{runners.length ? `Runner online${runners.length > 1 ? ` (${runners.length})` : ''}` : 'No runner online'}</strong>
+              {runners.length ? runnerInfo.map((r) => (
+                <small key={r.name}>{r.name}: {r.busyWith ? `${r.busyStatus === 'needs_help' ? 'waiting for you on' : 'working on'} ${hostOf(r.busyWith)}` : 'idle, waiting for sites'}</small>))
+                : <small>Queued sites will wait</small>}</div>
           </div>
           <button className="nav-item" onClick={async () => { await api('/login', { method: 'DELETE' }); window.location.href = '/login'; }}>
             <Icon name="logout" /><span>Log out</span></button>
@@ -104,7 +110,7 @@ export default function Dashboard() {
         <div className="page-head"><h1>{titles[tab][0]}</h1><p>{titles[tab][1]}</p></div>
         {tab === 'clients' && <Clients clients={clients} reload={loadClients} notify={notify} />}
         {tab === 'sites' && <Sites sites={sites} reload={loadSites} notify={notify} />}
-        {tab === 'run' && <Run clients={clients} sites={sites} jobs={jobs} runners={runners} help={help} reload={loadJobs} notify={notify} go={setTab} ready={ready} />}
+        {tab === 'run' && <Run clients={clients} sites={sites} jobs={jobs} runners={runners} runnerInfo={runnerInfo} help={help} reload={loadJobs} notify={notify} go={setTab} ready={ready} />}
         {tab === 'setup' && <Setup notify={notify} />}
       </main>
 
@@ -219,8 +225,18 @@ function Clients({ clients, reload, notify }) {
 function Sites({ sites, reload, notify }) {
   const [text, setText] = useState('');
   const [query, setQuery] = useState('');
+  const [editing, setEditing] = useState(null); // { id, value } while a listing page is being edited
   const pending = text.split(/[\s,]+/).filter(Boolean).length;
   const shown = sites.filter((s) => s.url.toLowerCase().includes(query.toLowerCase()));
+  // Runners save listing pages while the team works; show the latest when the tab opens.
+  useEffect(() => { reload(); }, [reload]);
+
+  async function saveListing(id, value) {
+    const r = await api('/sites/' + id, { method: 'PATCH', body: JSON.stringify({ submitUrl: value }) });
+    if (r.error) return notify(r.error, 'bad');
+    setEditing(null); reload();
+    notify(value ? 'Listing page saved: the runner goes straight there next time' : 'Listing page cleared: the runner will search the site again');
+  }
 
   async function add() {
     const r = await post('/sites', { urls: text });
@@ -248,7 +264,19 @@ function Sites({ sites, reload, notify }) {
           <li key={s.id}>
             <Avatar text={hostOf(s.url)} />
             <div className="grow"><strong>{hostOf(s.url)}</strong><small>{s.url}</small>
-              {s.submitUrl && <small>Listing page: <a href={s.submitUrl} target="_blank" rel="noreferrer">{s.submitUrl}</a></small>}</div>
+              {editing?.id === s.id ? (
+                <div className="row listing-edit">
+                  <input autoFocus value={editing.value} placeholder="https://site.com/add-your-business"
+                    onChange={(e) => setEditing({ id: s.id, value: e.target.value })}
+                    onKeyDown={(e) => { if (e.key === 'Enter') saveListing(s.id, editing.value); if (e.key === 'Escape') setEditing(null); }} />
+                  <button className="btn primary" onClick={() => saveListing(s.id, editing.value)}>Save</button>
+                  {s.submitUrl && <button className="btn ghost" onClick={() => saveListing(s.id, '')}>Clear</button>}
+                  <button className="btn ghost" onClick={() => setEditing(null)}>Cancel</button>
+                </div>
+              ) : s.submitUrl
+                ? <small>Listing page: <a href={s.submitUrl} target="_blank" rel="noreferrer">{s.submitUrl}</a></small>
+                : <small className="muted">Listing page: not known yet (the runner searches the site)</small>}</div>
+            <button className="btn icon-only ghost" title="Set the listing page" onClick={() => setEditing({ id: s.id, value: s.submitUrl || '' })}><Icon name="edit" /></button>
             <a className="btn icon-only ghost" href={s.url} target="_blank" rel="noreferrer" title="Open site"><Icon name="external" /></a>
             <button className="btn icon-only danger-ghost" title="Remove" onClick={async () => { await api('/sites/' + s.id, { method: 'DELETE' }); reload(); }}><Icon name="trash" /></button>
           </li>))}</ul>
@@ -258,9 +286,12 @@ function Sites({ sites, reload, notify }) {
   );
 }
 
-function Run({ clients, sites, jobs, runners, help, reload, notify, go, ready }) {
+function Run({ clients, sites, jobs, runners, runnerInfo, help, reload, notify, go, ready }) {
   const [clientId, setClientId] = useState('');
   const [mode, setMode] = useState('review');
+  const [starting, setStarting] = useState(false);
+  const [openJob, setOpenJob] = useState(null);
+  const closeJob = useCallback(() => setOpenJob(null), []);
   const [off, setOff] = useState(() => new Set());
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState('all');
@@ -269,20 +300,24 @@ function Run({ clients, sites, jobs, runners, help, reload, notify, go, ready })
   const shownSites = sites.filter((s) => s.url.toLowerCase().includes(query.toLowerCase()));
 
   const counts = useMemo(() => {
-    const c = { pending: 0, running: 0, needs_help: 0, submitted: 0, unconfirmed: 0, failed: 0 };
+    const c = { pending: 0, running: 0, needs_help: 0, submitted: 0, unconfirmed: 0, failed: 0, skipped: 0 };
     for (const j of jobs) c[j.status] = (c[j.status] || 0) + 1;
     return c;
   }, [jobs]);
   const active = counts.pending + counts.running + counts.needs_help;
   const filters = [['all', 'All', jobs.length], ['active', 'Active', active], ['needs_help', 'Needs you', counts.needs_help],
-    ['submitted', 'Submitted', counts.submitted], ['unconfirmed', 'Unconfirmed', counts.unconfirmed], ['failed', 'Failed', counts.failed]];
+    ['submitted', 'Submitted', counts.submitted], ['unconfirmed', 'Unconfirmed', counts.unconfirmed], ['failed', 'Failed', counts.failed], ['skipped', 'Skipped', counts.skipped]];
   const shownJobs = jobs.filter((j) => filter === 'all' || (filter === 'active' ? ACTIVE.includes(j.status) : j.status === filter));
 
   function toggle(id) { const n = new Set(off); n.has(id) ? n.delete(id) : n.add(id); setOff(n); }
   async function start() {
-    const r = await post('/run', { clientId: cid, siteIds: selected.map((s) => s.id), reviewMode: mode === 'review' });
+    setStarting(true);
+    const r = await post('/run', { clientId: cid, siteIds: selected.map((s) => s.id), reviewMode: mode === 'review' }).finally(() => setStarting(false));
     if (r.error) return notify(r.error, 'bad');
-    notify(`Queued ${selected.length} site${selected.length > 1 ? 's' : ''}`); reload();
+    const plural = (n) => `${n} site${n === 1 ? '' : 's'}`;
+    if (!r.queued) notify(`Nothing new queued: ${plural(r.alreadyQueued)} already queued or running for this client`, 'bad');
+    else notify(`Queued ${plural(r.queued)}${r.alreadyQueued ? `; ${plural(r.alreadyQueued)} were already queued, so not added again` : ''}${runners.length ? '' : '. Start a runner so they begin'}`);
+    reload();
   }
   const act = (p, msg) => post(p).then(() => { notify(msg); reload(); });
 
@@ -294,10 +329,15 @@ function Run({ clients, sites, jobs, runners, help, reload, notify, go, ready })
           <div key={l} className={'stat ' + k}><span>{l}</span><strong>{n}</strong></div>))}
       </div>
 
-      {!runners.length && (
+      {!runners.length ? (
         <div className="banner"><Icon name="monitor" size={18} />
-          <div><strong>No runner is online.</strong> Queued sites will wait until a team PC starts the runner.</div>
-          <button className="btn ghost" onClick={() => go('setup')}>Set up a runner</button></div>)}
+          <div><strong>No runner is online.</strong> {active ? `${active} site${active === 1 ? ' is' : 's are'} waiting. ` : ''}Queued sites start when a team PC opens the <strong>Backlink Runner</strong> (desktop shortcut).</div>
+          <button className="btn ghost" onClick={() => go('setup')}>Set up a runner</button></div>
+      ) : (
+        <div className="banner ok"><span className="pulse" />
+          <div>{runnerInfo.map((r) => (
+            <div key={r.name}><strong>{r.name}</strong>: {r.busyWith ? <>{r.busyStatus === 'needs_help' ? 'waiting for you on ' : 'working on '}<strong>{hostOf(r.busyWith)}</strong></> : counts.pending ? 'starting the next site' : 'online, waiting for sites'}</div>))}</div>
+        </div>)}
 
       {help.map((j) => (
         <section key={j.id} className="card needs">
@@ -308,6 +348,7 @@ function Run({ clients, sites, jobs, runners, help, reload, notify, go, ready })
             <div className="row">
               <button className="btn primary" onClick={() => act(`/jobs/${j.id}/continue`, 'Continuing')}><Icon name="play" />Continue</button>
               <button className="btn ghost" onClick={() => act(`/jobs/${j.id}/skip`, 'Skipped')}><Icon name="skip" />Skip this site</button>
+              <button className="btn ghost" onClick={() => setOpenJob(j.id)}><Icon name="list" />What it did</button>
               {j.hasShot && <a className="btn ghost" href={`/api/shots/${j.id}`} target="_blank" rel="noreferrer"><Icon name="image" />Screenshot</a>}
             </div>
           </div>
@@ -347,7 +388,7 @@ function Run({ clients, sites, jobs, runners, help, reload, notify, go, ready })
           <div className="action-bar">
             <button className="btn danger-ghost" onClick={() => act('/run/stop', 'Stopping run')} disabled={!active}><Icon name="stop" />Stop</button>
             <span className="grow" />
-            <button className="btn primary lg" onClick={start} disabled={!selected.length}><Icon name="play" />Start run · {selected.length} site{selected.length === 1 ? '' : 's'}</button>
+            <button className="btn primary lg" onClick={start} disabled={!selected.length || starting}><Icon name="play" />{starting ? 'Queueing…' : `Start run · ${selected.length} site${selected.length === 1 ? '' : 's'}`}</button>
           </div>
         </>)}
       </section>
@@ -363,7 +404,7 @@ function Run({ clients, sites, jobs, runners, help, reload, notify, go, ready })
           <div className="table-wrap"><table>
             <thead><tr><th>Site</th><th>Status</th><th>Note</th><th>Updated</th><th /></tr></thead>
             <tbody>{shownJobs.map((j) => (
-              <tr key={j.id}>
+              <tr key={j.id} className="clickable" onClick={(e) => { if (!e.target.closest('a')) setOpenJob(j.id); }} title="Show what the runner did on this site">
                 <td><strong>{hostOf(j.url)}</strong><small>{j.clientName}</small></td>
                 <td><span className={'pill ' + j.status}>{STATUS_LABEL[j.status] || j.status}</span></td>
                 <td className="note">{j.note}{j.runner && <small>on {j.runner}</small>}</td>
@@ -373,6 +414,57 @@ function Run({ clients, sites, jobs, runners, help, reload, notify, go, ready })
           </table></div>
         ) : <div className="empty"><Icon name="play" size={28} /><p>{jobs.length ? 'No jobs in this view.' : 'No jobs yet. Start a run above.'}</p></div>}
       </section>
+      {openJob && <JobDetails id={openJob} close={closeJob} />}
+    </div>
+  );
+}
+
+const STEP_ICON = { ok: 'check', warn: 'alert', bad: 'x', person: 'users', info: 'play' };
+
+// Everything the runner did on one site: the timeline of steps, the fields it filled and with what,
+// the account it used, the listing page and the latest screenshot. Refreshes while the job is active.
+function JobDetails({ id, close }) {
+  const [d, setD] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    const load = () => api('/jobs/' + id).then((r) => { if (alive) setD(r); });
+    load();
+    const t = setInterval(load, 3000);
+    const onKey = (e) => { if (e.key === 'Escape') close(); };
+    window.addEventListener('keydown', onKey);
+    return () => { alive = false; clearInterval(t); window.removeEventListener('keydown', onKey); };
+  }, [id, close]);
+  const log = d?.log || [];
+  const fieldSteps = log.filter((s) => s.data?.fields?.length);
+  return (
+    <div className="overlay" onClick={(e) => { if (e.target === e.currentTarget) close(); }}>
+      <aside className="drawer" role="dialog" aria-label="Job details">
+        <div className="drawer-head">
+          <div><h2>{d ? hostOf(d.url) : 'Loading…'}</h2>
+            {d && <p className="muted">{d.clientName} · {d.reviewMode ? 'Review each submit' : 'Fully automatic'}{d.runner ? ` · Chrome on ${d.runner}` : ''}</p>}</div>
+          <button className="btn icon-only ghost" title="Close" onClick={close}><Icon name="x" /></button>
+        </div>
+        {d && !d.error && (<div className="drawer-body">
+          <div className="row"><span className={'pill ' + d.status}>{STATUS_LABEL[d.status] || d.status}</span><span className="muted">{ago(d.updatedAt)}</span></div>
+          <p className="drawer-note">{d.note}</p>
+          <dl className="facts">
+            <dt>Site</dt><dd><a href={d.url} target="_blank" rel="noreferrer">{d.url}</a></dd>
+            <dt>Listing page</dt><dd>{d.submitUrl ? <a href={d.submitUrl} target="_blank" rel="noreferrer">{d.submitUrl}</a> : <span className="muted">not known yet</span>}</dd>
+            <dt>Account</dt><dd>{d.account ? <>{d.account.email || d.account.username}{d.account.username && d.account.email ? ` (username ${d.account.username})` : ''} <span className="muted">· saved {ago(d.account.createdAt)}</span></> : <span className="muted">none created on this site</span>}</dd>
+          </dl>
+          {fieldSteps.map((s, i) => (
+            <div key={i}><h3>{s.text}</h3>
+              <table className="mini"><thead><tr><th>Field on the site</th><th>Filled with</th></tr></thead>
+                <tbody>{s.data.fields.map((f, k) => <tr key={k}><td>{f.field}<small>{f.as}</small></td><td>{f.value}</td></tr>)}</tbody></table></div>))}
+          <h3>What happened</h3>
+          {log.length ? <ol className="timeline">{log.map((s, i) => (
+            <li key={i} className={s.kind}><span className="dot"><Icon name={STEP_ICON[s.kind] || 'play'} size={12} /></span>
+              <div><span>{s.text}</span><small>{new Date(s.at).toLocaleTimeString()}</small></div></li>))}</ol>
+            : <p className="muted">No steps recorded yet{d.status === 'pending' ? ': this site is waiting for a runner.' : '. (Jobs from before this update have only the note above.)'}</p>}
+          {d.hasShot && <><h3>Latest screenshot</h3>
+            <a href={`/api/shots/${d.id}`} target="_blank" rel="noreferrer"><img className="shot" src={`/api/shots/${d.id}?t=${new Date(d.updatedAt).getTime()}`} alt="Latest screenshot of the site" /></a></>}
+        </div>)}
+      </aside>
     </div>
   );
 }
