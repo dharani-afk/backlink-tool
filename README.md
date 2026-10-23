@@ -28,7 +28,7 @@ Several team members can run a runner at the same time; each site goes to exactl
 ## Use
 
 1. Open the Vercel address and log in with the team password.
-2. **Runner setup tab:** download the runner on each PC that will do submissions, unzip it, and double-click **Start Runner.bat** (Windows) or **Start Runner (Mac).command**. On first start, paste the dashboard address and runner token shown in that tab. Google Chrome must be installed; Node.js is downloaded automatically if missing.
+2. **Runner setup tab:** on each Windows PC that will do submissions, copy the install command shown there, paste it into PowerShell and press Enter. It installs the runner into `%LOCALAPPDATA%\BacklinkRunner` (downloading Node.js if missing), connects it to the dashboard, adds a **Backlink Runner** desktop shortcut and starts it. Google Chrome must be installed. Windows blocks a downloaded `Start Runner.bat` (Smart App Control and SmartScreen block scripts carrying the "downloaded from the internet" mark), which is why Windows uses the command (`public/install.ps1`). On a Mac, download the runner zip from the same tab, unzip it, double-click **Start Runner (Mac).command** and paste the dashboard address and runner token when asked.
 3. **Clients tab:** create a profile. Use an email address your team can read, since sites send verification emails there.
 4. **Sites tab:** paste the target sites.
 5. **Run tab:** pick a client, sites and a mode, and press Start. Chrome opens on the runner PC.

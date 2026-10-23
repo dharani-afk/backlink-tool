@@ -383,13 +383,15 @@ function Setup({ notify }) {
   const [origin, setOrigin] = useState('');
   useEffect(() => { setOrigin(window.location.origin); api('/runner-token').then((d) => setToken(d.token || '')); }, []);
   const copy = (v, what) => navigator.clipboard.writeText(v).then(() => notify(`${what} copied`));
+  // Windows blocks a downloaded Start Runner.bat (Smart App Control, SmartScreen), so Windows PCs install with
+  // one PowerShell command instead: nothing it downloads carries the "from the internet" mark.
+  const installCmd = (t) => `& ([scriptblock]::Create((irm ${origin}/install.ps1))) -Server ${origin} -Token ${t}`;
 
   const steps = [
     ['Install Google Chrome', <>If the PC doesn&apos;t have it, get it from <a href="https://www.google.com/chrome/" target="_blank" rel="noreferrer">google.com/chrome</a>.</>],
-    ['Download the runner', <span className="row"><a className="btn primary" href="/backlink-runner.zip"><Icon name="download" />Download runner (.zip)</a><span className="muted">Unzip it anywhere on the PC.</span></span>],
-    ['Start it', <>Double-click <strong>Start Runner.bat</strong> on Windows or <strong>Start Runner (Mac).command</strong> on Mac. The first start installs itself (about a minute).</>],
-    ['Connect it to this dashboard', <>When asked, paste these two values:</>],
-    ['Keep the window open', <>The status in the sidebar turns green when the runner is online. Queued sites then start automatically.</>],
+    ['Copy the install command', <>It already contains this dashboard&apos;s address and the runner token.</>],
+    ['Run it in PowerShell', <>Press <strong>Start</strong>, type <strong>PowerShell</strong>, press <strong>Enter</strong>. Paste the command (right-click), press <strong>Enter</strong>. It installs the runner (about a minute the first time), adds a <strong>Backlink Runner</strong> shortcut to the desktop and starts it.</>],
+    ['Keep the runner window open', <>The status in the sidebar turns green when the runner is online. Queued sites then start automatically. Next time, double-click <strong>Backlink Runner</strong> on the desktop.</>],
   ];
 
   return (
@@ -398,14 +400,25 @@ function Setup({ notify }) {
         <p className="lead">The website stores clients, sites and results. The sign-ups themselves happen in Google Chrome on a team member&apos;s PC, so a person can solve CAPTCHAs and click email links. That PC runs a small program called the <strong>runner</strong>.</p>
         <ol className="steps">{steps.map(([t, body], i) => (
           <li key={t}><span className="step-num">{i + 1}</span><div><strong>{t}</strong><div className="step-body">{body}</div>
-            {i === 3 && <div className="secrets">
-              <div className="secret"><label>Dashboard address</label><code>{origin}</code>
-                <button className="btn icon-only ghost" title="Copy" onClick={() => copy(origin, 'Address')}><Icon name="copy" /></button></div>
-              <div className="secret"><label><Icon name="lock" size={12} /> Runner token (keep private)</label>
-                <code>{token ? (show ? token : '•'.repeat(32)) : 'RUNNER_TOKEN is not set on the server'}</code>
-                {token && <button className="btn icon-only ghost" title={show ? 'Hide' : 'Show'} onClick={() => setShow(!show)}><Icon name={show ? 'eyeOff' : 'eye'} /></button>}
-                {token && <button className="btn icon-only ghost" title="Copy" onClick={() => copy(token, 'Token')}><Icon name="copy" /></button>}</div>
+            {i === 1 && <div className="secrets">
+              <div className="secret"><label><Icon name="lock" size={12} /> Windows install command (contains the runner token, keep private)</label>
+                <code>{token ? installCmd(show ? token : '•'.repeat(32)) : 'RUNNER_TOKEN is not set on the server'}</code>
+                {token && <button className="btn icon-only ghost" title={show ? 'Hide token' : 'Show token'} onClick={() => setShow(!show)}><Icon name={show ? 'eyeOff' : 'eye'} /></button>}
+                {token && <button className="btn icon-only ghost" title="Copy" onClick={() => copy(installCmd(token), 'Install command')}><Icon name="copy" /></button>}</div>
             </div>}</div></li>))}</ol>
+      </section>
+      <section className="card">
+        <div className="card-head"><div><h2>On a Mac, or installing by hand</h2>
+          <p className="muted">Download the runner, unzip it and double-click <strong>Start Runner (Mac).command</strong>. When asked, paste these two values. On Windows use the command above: Windows blocks a downloaded Start Runner.bat.</p></div></div>
+        <div className="row"><a className="btn" href="/backlink-runner.zip"><Icon name="download" />Download runner (.zip)</a></div>
+        <div className="secrets">
+          <div className="secret"><label>Dashboard address</label><code>{origin}</code>
+            <button className="btn icon-only ghost" title="Copy" onClick={() => copy(origin, 'Address')}><Icon name="copy" /></button></div>
+          <div className="secret"><label><Icon name="lock" size={12} /> Runner token (keep private)</label>
+            <code>{token ? (show ? token : '•'.repeat(32)) : 'RUNNER_TOKEN is not set on the server'}</code>
+            {token && <button className="btn icon-only ghost" title={show ? 'Hide' : 'Show'} onClick={() => setShow(!show)}><Icon name={show ? 'eyeOff' : 'eye'} /></button>}
+            {token && <button className="btn icon-only ghost" title="Copy" onClick={() => copy(token, 'Token')}><Icon name="copy" /></button>}</div>
+        </div>
       </section>
     </div>
   );

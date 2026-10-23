@@ -1,0 +1,14 @@
+# Same exclusions as .gitignore, for `vercel deploy` from a local folder.
+.git/
+node_modules/
+.next/
+.localdb/
+.env*
+!.env.example
+_old/
+public/backlink-runner.zip
+.mcp.json
+runner/node_modules/
+runner/runtime/
+runner/browser-profile/
+runner/config.json
